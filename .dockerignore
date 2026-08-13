@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+node_modules
+dist
+dist-server
+data
+coverage
+npm-debug.log*
+pnpm-debug.log*

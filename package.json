@@ -1,0 +1,38 @@
+{
+  "name": "relay-drop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A lightweight self-hosted shared clipboard and file drop.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others --names web,api \"vite --host 0.0.0.0\" \"tsx watch server/index.ts\"",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "start": "node dist-server/index.js",
+    "test": "tsx --test server/index.test.ts",
+    "lint": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^9.3.0",
+    "@fastify/static": "^10.1.2",
+    "fastify": "^5.8.5",
+    "lucide-react": "^1.27.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "sharp": "^0.35.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^10.0.4",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.13"
+  }
+}

@@ -1,0 +1,195 @@
+# Relay Drop
+
+一个轻量、自托管的跨设备共享剪贴板和文件中转站。
+
+在电脑、手机或临时设备上打开同一个域名，就能看到同一段文字和同一个文件列表。它不是“生成分享链接”的网盘：上传后，其他设备刷新页面即可直接取走。
+
+> Lightweight self-hosted shared clipboard and file drop. Every authenticated device sees the same clipboard and file list.
+
+## 功能
+
+- 共享文字剪贴板：粘贴、保存、复制、清空，支持 `⌘/Ctrl + Enter` 快速同步。
+- 直接粘贴截图：图片会自动上传到文件区。
+- 多文件拖拽上传与逐文件进度。
+- 文件下载、重命名、搜索、排序、单个删除和批量删除。
+- PNG、JPEG、GIF、WebP、AVIF 自动生成约 `96 × 96` 的 WebP 缩略图；文件列表不会反复读取原图。
+- 文件默认永久保存，由使用者手动删除。
+- 明暗主题与手机端自适应。
+- 默认单文件上限 4 GiB、总空间硬上限 20 GiB。
+- Caddy 自动 HTTPS、Argon2id 密码哈希和可选 Fail2ban 防爆破。
+
+## 适合什么场景
+
+Relay Drop 适合一个人或一个互相信任的小组，在多台设备之间临时传文字和文件。
+
+它没有独立用户空间：知道共享账号密码的人都能查看剪贴板、下载、重命名和删除所有文件。如果需要成员权限、审计、文件夹或独立配额，请使用完整网盘产品。
+
+## 架构
+
+```text
+Browser ── HTTPS ── Caddy + Basic Auth ── Relay ── Docker volume
+                                             ├── state.json
+                                             ├── files/
+                                             └── thumbnails/
+```
+
+- 前端：React、Vite、TypeScript。
+- 后端：Node.js、Fastify。
+- 图片缩略图：Sharp。
+- 存储：JSON 元数据和普通文件，不需要数据库。
+- 上传：流式写入磁盘，不把大文件整体读入内存。
+
+## 使用 Docker Compose 部署
+
+下面的部署方式面向带公网 IP 的 Linux VPS，例如 Debian 或 Ubuntu。需要：
+
+- 一个已解析到 VPS 的域名；
+- 公网放行 **TCP 80 和 TCP 443**；
+- Docker Engine 和 Docker Compose 插件；
+- 80/443 端口没有被其他服务占用。
+
+### 1. 下载并准备配置
+
+```bash
+# 将 REPOSITORY_URL 替换为仓库页面 “Code” 按钮显示的 HTTPS 地址
+git clone REPOSITORY_URL relay-drop
+cd relay-drop
+cp .env.example .env
+chmod 600 .env
+sudo mkdir -p /var/log/relay-caddy
+```
+
+### 2. 生成登录密码哈希
+
+执行：
+
+```bash
+docker run --rm -it caddy:2.11.4-alpine \
+  caddy hash-password --algorithm argon2id
+```
+
+输入自己记得住的强密码，把输出的整段 Argon2id 哈希填入 `.env`。哈希含有 `$`，必须保留单引号：
+
+```dotenv
+DOMAIN=drop.example.com
+AUTH_USER=your-user-name
+AUTH_PASSWORD_HASH='$argon2id$v=19$...'
+MAX_UPLOAD_BYTES=4294967296
+MAX_STORAGE_BYTES=21474836480
+```
+
+`.env` 只保留密码哈希，不需要保存明文密码。不要提交 `.env`。
+
+### 3. 启动
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+Caddy 会自动申请并续期 HTTPS 证书。稍等片刻后打开：
+
+```text
+https://你的域名
+```
+
+未登录访问应返回 `401`，输入 `.env` 中的用户名和原始密码后即可使用。
+
+### 4. 修改密码
+
+在项目目录执行：
+
+```bash
+sudo ./deploy/relay-set-password
+```
+
+脚本会交互式读取新密码，终端不回显；更新 `.env` 中的 Argon2id 哈希并重启 Caddy。最低接受 8 个字符，建议使用独特且不容易猜到的密码。
+
+## 可选：启用 Fail2ban
+
+Fail2ban 配置会在 10 分钟内出现 5 次认证失败后，将来源 IP 封禁 12 小时。
+
+```bash
+sudo apt update
+sudo apt install -y fail2ban
+sudo cp deploy/fail2ban/filter.d/relay-caddy.conf /etc/fail2ban/filter.d/
+sudo cp deploy/fail2ban/jail.d/relay-caddy.local /etc/fail2ban/jail.d/
+sudo systemctl restart fail2ban
+sudo fail2ban-client status relay-caddy
+```
+
+浏览器自动请求的 `/favicon.ico` 返回 `204`，不会被计作密码失败。请不要随意将大段公共网段加入 `ignoreip`。
+
+## 数据、配额与备份
+
+用户数据保存在 Docker 卷 `relay-drop-data`。更新或重建容器不会删除该卷。
+
+默认限制：
+
+- 单文件：`4294967296` 字节（4 GiB）；
+- 整体空间：`21474836480` 字节（20 GiB）。
+
+可以在 `.env` 中修改。服务端会在上传过程中检查配额，超过上限时终止上传并清理临时文件。缩略图也计入总配额。
+
+备份示例：
+
+```bash
+docker run --rm \
+  -v relay-drop-data:/data:ro \
+  -v "$PWD":/backup \
+  alpine tar czf /backup/relay-drop-backup.tgz -C /data .
+```
+
+请把备份文件移到另一台机器或对象存储，不要只放在同一块 VPS 硬盘上。
+
+## 更新与运维
+
+```bash
+git pull
+docker compose up -d --build
+docker compose logs --tail=100 relay caddy
+```
+
+停止服务但保留数据：
+
+```bash
+docker compose down
+```
+
+不要执行 `docker compose down -v`，除非明确想永久删除数据卷。
+
+## 本地开发
+
+需要 Node.js 22+ 和 pnpm：
+
+```bash
+pnpm install
+pnpm dev
+```
+
+打开 `http://localhost:5173`。开发模式不会启用 Caddy 登录保护。
+
+检查：
+
+```bash
+pnpm lint
+NODE_ENV=test pnpm test
+pnpm build
+```
+
+## 安全说明
+
+- 公网只应暴露 Caddy 的 TCP 80/443；Relay 应保持在 `127.0.0.1:8787`。
+- Basic Auth 依赖 HTTPS 保护，绝不能绕过 Caddy 用 HTTP 访问应用端口。
+- 上传内容以随机内部文件名保存，和静态网页目录隔离；下载强制作为附件。
+- 服务端包含路径穿越防护、请求大小限制、存储配额、安全响应头和 `noindex`。
+- 容器使用只读根文件系统、丢弃多余 capabilities、禁止提权，并限制内存和进程数。
+- 缩略图仅处理白名单图片格式，限制输入像素并串行生成。
+- 这不是端到端加密或零知识存储：VPS 管理员能够读取文件和剪贴板。需要静态加密时，请另行配置磁盘加密或加密存储层。
+- 在公共电脑上建议使用隐私窗口、不要保存密码，使用完关闭全部隐私窗口。
+
+如果发现安全问题，请阅读 [SECURITY.md](SECURITY.md)，不要在公开 Issue 中披露可利用细节。
+
+## 许可证
+
+[MIT](LICENSE)

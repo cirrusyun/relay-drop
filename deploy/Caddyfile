@@ -1,0 +1,37 @@
+{
+	admin off
+}
+
+{$DOMAIN} {
+	log {
+		output file /var/log/caddy/access.json {
+			roll_size 20MiB
+			roll_keep 10
+			roll_keep_for 720h
+		}
+		format json
+	}
+
+	encode zstd gzip
+
+	route {
+		# 安全响应头放在认证前，确保 401 响应同样受到浏览器保护。
+		header {
+			Strict-Transport-Security "max-age=31536000; includeSubDomains"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+			Referrer-Policy "no-referrer"
+			X-Robots-Tag "noindex, nofollow, noarchive"
+		}
+
+		# Browsers may request this before authentication. Keep it out of auth-failure logs.
+		@favicon path /favicon.ico
+		respond @favicon 204
+
+		basic_auth argon2id {
+			{$AUTH_USER} {$AUTH_PASSWORD_HASH}
+		}
+
+		reverse_proxy 127.0.0.1:8787
+	}
+}

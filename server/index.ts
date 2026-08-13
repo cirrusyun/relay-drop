@@ -1,0 +1,369 @@
+import multipart from "@fastify/multipart";
+import fastifyStatic from "@fastify/static";
+import Fastify, { type FastifyInstance } from "fastify";
+import { createReadStream, createWriteStream } from "node:fs";
+import { rename, rm, stat } from "node:fs/promises";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import sharp from "sharp";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { normalizeFilename, RelayStore, type FileRecord } from "./store.js";
+
+interface BuildOptions {
+  dataDir?: string;
+  maxUploadBytes?: number;
+  maxStorageBytes?: number;
+  serveFrontend?: boolean;
+}
+
+const DEFAULT_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_STORAGE_BYTES = 20 * 1024 * 1024 * 1024;
+const MAX_CLIPBOARD_CHARACTERS = 1_000_000;
+const THUMBNAIL_RESERVATION_BYTES = 128 * 1024;
+const THUMBNAIL_IMAGE_TYPES = new Set([
+  "image/avif",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+
+sharp.cache({ files: 0, items: 32, memory: 32 });
+sharp.concurrency(1);
+
+class QuotaTracker {
+  private committedBytes: number;
+  private inFlightBytes = 0;
+
+  constructor(readonly maxBytes: number, initialBytes: number) {
+    this.committedBytes = initialBytes;
+  }
+
+  get usedBytes() { return this.committedBytes; }
+  get availableBytes() { return Math.max(0, this.maxBytes - this.committedBytes - this.inFlightBytes); }
+
+  claim(bytes: number): boolean {
+    if (bytes > this.availableBytes) return false;
+    this.inFlightBytes += bytes;
+    return true;
+  }
+
+  release(bytes: number) {
+    this.inFlightBytes = Math.max(0, this.inFlightBytes - bytes);
+  }
+
+  commit(bytes: number) {
+    this.release(bytes);
+    this.committedBytes += bytes;
+  }
+
+  removeCommitted(bytes: number) {
+    this.committedBytes = Math.max(0, this.committedBytes - bytes);
+  }
+}
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function contentDisposition(name: string, disposition: "attachment" | "inline" = "attachment"): string {
+  const fallback = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+function publicFile(file: FileRecord) {
+  const { storedName: _storedName, ...safe } = file;
+  return safe;
+}
+
+function publicFileWithThumbnail(file: FileRecord, hasThumbnail: boolean) {
+  return { ...publicFile(file), hasThumbnail };
+}
+
+export async function buildApp(options: BuildOptions = {}): Promise<FastifyInstance> {
+  const maxUploadBytes = options.maxUploadBytes ?? positiveInteger(
+    process.env.MAX_UPLOAD_BYTES,
+    DEFAULT_MAX_UPLOAD_BYTES,
+  );
+  const maxStorageBytes = options.maxStorageBytes ?? positiveInteger(
+    process.env.MAX_STORAGE_BYTES,
+    DEFAULT_MAX_STORAGE_BYTES,
+  );
+  const dataDir = options.dataDir ?? process.env.DATA_DIR ?? path.resolve("data");
+  const serveFrontend = options.serveFrontend ?? process.env.NODE_ENV === "production";
+  const store = new RelayStore(dataDir);
+  await store.init();
+  const thumbnailBytes = await store.totalThumbnailBytes();
+  const quota = new QuotaTracker(
+    maxStorageBytes,
+    store.snapshot().files.reduce((sum, file) => sum + file.size, thumbnailBytes),
+  );
+
+  const app = Fastify({
+    logger: process.env.NODE_ENV !== "test",
+    bodyLimit: 1_100_000,
+    trustProxy: true,
+  });
+
+  let thumbnailQueue = Promise.resolve();
+  const ensureThumbnail = (file: FileRecord): Promise<boolean> => {
+    const operation = thumbnailQueue.then(async () => {
+      if (!THUMBNAIL_IMAGE_TYPES.has(file.mime) || !(await store.verifyFile(file))) return false;
+      if (await store.thumbnailSize(file)) return true;
+
+      const temporaryPath = `${store.thumbnailPath(file)}.uploading`;
+      let reservedBytes = 0;
+      try {
+        if (!quota.claim(THUMBNAIL_RESERVATION_BYTES)) return false;
+        reservedBytes = THUMBNAIL_RESERVATION_BYTES;
+        await sharp(store.filePath(file), {
+          animated: false,
+          failOn: "error",
+          limitInputPixels: 24_000_000,
+          pages: 1,
+        })
+          .rotate()
+          .resize(96, 96, { fit: "cover", position: "attention", withoutEnlargement: true })
+          .webp({ quality: 58, effort: 4, smartSubsample: true })
+          .toFile(temporaryPath);
+        const size = (await stat(temporaryPath)).size;
+        if (size > reservedBytes && !quota.claim(size - reservedBytes)) {
+          throw new Error("Thumbnail exceeded its storage reservation");
+        }
+        if (size < reservedBytes) quota.release(reservedBytes - size);
+        reservedBytes = size;
+        await rename(temporaryPath, store.thumbnailPath(file));
+        quota.commit(size);
+        reservedBytes = 0;
+        return true;
+      } catch (error) {
+        quota.release(reservedBytes);
+        await rm(temporaryPath, { force: true });
+        app.log.warn({ fileId: file.id, error }, "Unable to generate image thumbnail");
+        return false;
+      }
+    });
+    thumbnailQueue = operation.then(() => undefined, () => undefined);
+    return operation;
+  };
+
+  for (const file of store.snapshot().files) {
+    await ensureThumbnail(file);
+  }
+
+  await app.register(multipart, {
+    limits: { files: 1, fields: 2, parts: 3, fileSize: maxUploadBytes },
+    throwFileSizeLimit: true,
+  });
+
+  app.addHook("onSend", async (_request, reply) => {
+    reply
+      .header("X-Content-Type-Options", "nosniff")
+      .header("X-Frame-Options", "DENY")
+      .header("Referrer-Policy", "no-referrer")
+      .header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    if (!reply.hasHeader("Content-Security-Policy")) {
+      reply.header(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
+      );
+    }
+  });
+
+  app.get("/api/health", async () => ({ ok: true }));
+
+  app.get("/api/state", async () => {
+    const snapshot = store.snapshot();
+    return {
+      clipboard: snapshot.clipboard,
+      files: await Promise.all(snapshot.files.map(async (file) => (
+        publicFileWithThumbnail(file, Boolean(await store.thumbnailSize(file)))
+      ))),
+      limits: { maxUploadBytes },
+      storage: { usedBytes: quota.usedBytes, maxBytes: quota.maxBytes },
+    };
+  });
+
+  app.put<{ Body: { content?: unknown } }>("/api/clipboard", async (request, reply) => {
+    const content = request.body?.content;
+    if (typeof content !== "string") {
+      return reply.code(400).send({ error: "剪贴板内容必须是文字。" });
+    }
+    if (content.length > MAX_CLIPBOARD_CHARACTERS) {
+      return reply.code(413).send({ error: "剪贴板内容不能超过 100 万字符。" });
+    }
+    return { clipboard: await store.saveClipboard(content) };
+  });
+
+  app.delete("/api/clipboard", async () => ({ clipboard: await store.saveClipboard("") }));
+
+  app.post("/api/files", async (request, reply) => {
+    const part = await request.file();
+    if (!part) return reply.code(400).send({ error: "没有收到文件。" });
+
+    const storedName = store.newStoredName();
+    const temporaryPath = path.join(store.filesDir, `${storedName}.uploading`);
+    const finalPath = path.join(store.filesDir, storedName);
+    let claimedBytes = 0;
+    const quotaGuard = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        if (!quota.claim(chunk.length)) {
+          const error = Object.assign(new Error("共享空间已达到 20 GiB 存储上限。"), {
+            code: "STORAGE_QUOTA_EXCEEDED",
+            statusCode: 507,
+          });
+          callback(error);
+          return;
+        }
+        claimedBytes += chunk.length;
+        callback(null, chunk);
+      },
+    });
+
+    try {
+      await pipeline(
+        part.file,
+        quotaGuard,
+        createWriteStream(temporaryPath, { flags: "wx", mode: 0o600 }),
+      );
+      if (part.file.truncated) {
+        quota.release(claimedBytes);
+        claimedBytes = 0;
+        await rm(temporaryPath, { force: true });
+        return reply.code(413).send({ error: "文件超过了服务器允许的大小。" });
+      }
+      await rename(temporaryPath, finalPath);
+      const size = (await stat(finalPath)).size;
+      const createdAt = new Date().toISOString();
+      const file = await store.addFile({
+        name: normalizeFilename(part.filename),
+        storedName,
+        size,
+        mime: String(part.mimetype || "application/octet-stream").slice(0, 160),
+        createdAt,
+        expiresAt: null,
+      });
+      quota.commit(claimedBytes);
+      claimedBytes = 0;
+      const hasThumbnail = await ensureThumbnail(file);
+      return reply.code(201).send({ file: publicFileWithThumbnail(file, hasThumbnail) });
+    } catch (error) {
+      quota.release(claimedBytes);
+      await rm(temporaryPath, { force: true });
+      await rm(finalPath, { force: true });
+      throw error;
+    }
+  });
+
+  app.get<{ Params: { id: string } }>("/api/files/:id/download", async (request, reply) => {
+    const file = store.getFile(request.params.id);
+    if (!file || !(await store.verifyFile(file))) {
+      return reply.code(404).send({ error: "文件不存在。" });
+    }
+    reply
+      .header("Content-Type", "application/octet-stream")
+      .header("Content-Length", String(file.size))
+      .header("Content-Disposition", contentDisposition(file.name))
+      .header("Cache-Control", "private, no-store");
+    return reply.send(createReadStream(store.filePath(file)));
+  });
+
+  app.get<{ Params: { id: string } }>("/api/files/:id/thumbnail", async (request, reply) => {
+    const file = store.getFile(request.params.id);
+    if (!file || !(await store.verifyFile(file))) {
+      return reply.code(404).send({ error: "文件不存在。" });
+    }
+    const size = await store.thumbnailSize(file);
+    if (!size) return reply.code(404).send({ error: "这个文件没有缩略图。" });
+    reply
+      .header("Content-Type", "image/webp")
+      .header("Content-Length", String(size))
+      .header("Cache-Control", "private, max-age=31536000, immutable")
+      .header("Content-Security-Policy", "default-src 'none'; sandbox");
+    return reply.send(createReadStream(store.thumbnailPath(file)));
+  });
+
+  app.patch<{ Params: { id: string }; Body: { name?: unknown } }>("/api/files/:id", async (request, reply) => {
+    const requestedName = request.body?.name;
+    if (typeof requestedName !== "string" || !requestedName.trim()) {
+      return reply.code(400).send({ error: "文件名不能为空。" });
+    }
+    const file = await store.renameFile(request.params.id, normalizeFilename(requestedName));
+    if (!file) return reply.code(404).send({ error: "文件不存在。" });
+    return { file: publicFileWithThumbnail(file, Boolean(await store.thumbnailSize(file))) };
+  });
+
+  app.delete<{ Body: { ids?: unknown } }>("/api/files", async (request, reply) => {
+    const requestedIds = request.body?.ids;
+    if (!Array.isArray(requestedIds) || requestedIds.length === 0 || requestedIds.length > 2_000) {
+      return reply.code(400).send({ error: "请选择 1 到 2000 个要删除的文件。" });
+    }
+    const ids = [...new Set(requestedIds)];
+    if (ids.some((id) => typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id))) {
+      return reply.code(400).send({ error: "文件列表中包含无效项目。" });
+    }
+    await thumbnailQueue;
+    const removed = await store.deleteFiles(ids as string[]);
+    if (!removed.files.length) return reply.code(404).send({ error: "所选文件已不存在。" });
+    quota.removeCommitted(
+      removed.files.reduce((sum, file) => sum + file.size, removed.thumbnailBytes),
+    );
+    return {
+      removedIds: removed.files.map((file) => file.id),
+      storage: { usedBytes: quota.usedBytes, maxBytes: quota.maxBytes },
+    };
+  });
+
+  app.delete<{ Params: { id: string } }>("/api/files/:id", async (request, reply) => {
+    const file = store.getFile(request.params.id);
+    if (!file) {
+      return reply.code(404).send({ error: "文件不存在。" });
+    }
+    await thumbnailQueue;
+    const removed = await store.deleteFiles([request.params.id]);
+    if (!removed.files.length) return reply.code(404).send({ error: "文件不存在。" });
+    quota.removeCommitted(file.size + removed.thumbnailBytes);
+    return reply.code(204).send();
+  });
+
+  app.setErrorHandler((error, _request, reply) => {
+    const appError = error as Error & { code?: string; statusCode?: number };
+    if (error instanceof app.multipartErrors.RequestFileTooLargeError) {
+      return reply.code(413).send({ error: "文件超过了服务器允许的大小。" });
+    }
+    if (appError.code === "STORAGE_QUOTA_EXCEEDED") {
+      return reply.code(507).send({ error: appError.message });
+    }
+    app.log.error(error);
+    const status = appError.statusCode && appError.statusCode < 500 ? appError.statusCode : 500;
+    return reply.code(status).send({ error: status === 500 ? "服务器暂时无法完成这个操作。" : appError.message });
+  });
+
+  if (serveFrontend) {
+    await app.register(fastifyStatic, {
+      root: path.resolve(process.cwd(), "dist"),
+      wildcard: false,
+      maxAge: "1h",
+    });
+    app.setNotFoundHandler((request, reply) => {
+      if (request.url.startsWith("/api/")) {
+        return reply.code(404).send({ error: "接口不存在。" });
+      }
+      return reply.header("Cache-Control", "no-cache").sendFile("index.html");
+    });
+  }
+
+  return app;
+}
+
+async function start() {
+  const app = await buildApp();
+  const port = positiveInteger(process.env.PORT, 8787);
+  await app.listen({ host: "0.0.0.0", port });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await start();
+}

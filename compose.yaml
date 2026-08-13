@@ -1,0 +1,63 @@
+name: relay-drop
+
+services:
+  relay:
+    build:
+      context: .
+    image: relay-drop:local
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8787
+      DATA_DIR: /data
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-4294967296}
+      MAX_STORAGE_BYTES: ${MAX_STORAGE_BYTES:-21474836480}
+    volumes:
+      - relay_data:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: unless-stopped
+    depends_on:
+      relay:
+        condition: service_healthy
+    network_mode: host
+    environment:
+      DOMAIN: ${DOMAIN}
+      AUTH_USER: ${AUTH_USER}
+      AUTH_PASSWORD_HASH: ${AUTH_PASSWORD_HASH}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - /var/log/relay-caddy:/var/log/caddy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+
+volumes:
+  relay_data:
+    name: relay-drop-data
+  caddy_data:
+    name: relay-drop-caddy-data
+  caddy_config:
+    name: relay-drop-caddy-config
