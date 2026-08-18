@@ -15,10 +15,12 @@ import {
   Music,
   Pencil,
   RefreshCw,
+  RotateCcw,
   Search,
   ShieldCheck,
   Sun,
   Trash2,
+  TriangleAlert,
   X,
 } from "lucide-react";
 import {
@@ -60,7 +62,15 @@ interface UploadTask {
   progress: number;
   status: "uploading" | "done" | "error";
   error?: string;
+  // 保留原文件引用，失败后可以在同一行重试，而不是新增一行。
+  file: globalThis.File;
+  // 只有网络类失败值得重试；配额、体积这类结论重试也不会变。
+  retryable?: boolean;
+  // 瞬时上行速度，字节/秒。慢的时候用户至少知道它还在动。
+  speed?: number;
 }
+
+type UploadOutcome = { ok: true } | { ok: false; message: string; retryable: boolean };
 
 interface ToastState {
   id: number;
@@ -74,6 +84,38 @@ const EMPTY_STATE: RelayState = {
   limits: { maxUploadBytes: 2 * 1024 * 1024 * 1024 },
   storage: { usedBytes: 0, maxBytes: 20 * 1024 * 1024 * 1024 },
 };
+
+// 并发上传会共用同一条 HTTP/2 连接：链路一断，所有文件一起失败。
+// 但网好的时候串行又太亏，所以并发数不写死，按实测的「上行速度」自己调。
+const UPLOAD_CONCURRENCY_MAX = 4;
+// 超过这个时间一个字节都没有前进，就认为链路已经死了，主动中断而不是干等。
+// 用「停滞时长」而不是「总时长」，大文件慢慢传也不会被误杀。
+const UPLOAD_STALL_MS = 90_000;
+// 网络类失败的尝试总次数（含第一次）。
+const UPLOAD_MAX_ATTEMPTS = 3;
+// 进度采样间隔，用来算瞬时速度。
+const SPEED_SAMPLE_MS = 500;
+// 测速结果的保质期。网络状况随时会变，超过这个时间就当没测过，重新用一个文件探路。
+const SPEED_FRESH_MS = 60_000;
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => { window.setTimeout(resolve, ms); });
+
+interface NetworkInformation { saveData?: boolean }
+
+// 按实测上行速度决定并发数。
+// 注意只用「上传」测出来的速度：navigator.connection 的 effectiveType 反映的是下行，
+// 而「下行正常、上行垮掉」是很常见的一种情况，用它判断会得出完全相反的结论。
+function concurrencyForSpeed(bytesPerSecond: number | null): number {
+  if (bytesPerSecond == null) return 1;                       // 还没测过：先用一个文件探路
+  if (bytesPerSecond >= 4 * 1024 * 1024) return UPLOAD_CONCURRENCY_MAX;
+  if (bytesPerSecond >= 1024 * 1024) return 3;
+  if (bytesPerSecond >= 384 * 1024) return 2;
+  return 1;                                                    // 弱网：串行，保住已经传完的
+}
+
+function prefersReducedData(): boolean {
+  return (navigator as Navigator & { connection?: NetworkInformation }).connection?.saveData === true;
+}
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
@@ -127,6 +169,18 @@ function pastedImageName(file: globalThis.File, index: number): string {
     String(now.getSeconds()).padStart(2, "0"),
   ].join("");
   return `剪贴板图片-${stamp}${index ? `-${index + 1}` : ""}.${extension}`;
+}
+
+// 重命名时默认只选中扩展名之前的部分，和 Finder / 资源管理器一致。
+// 想改扩展名仍然可以：⌘A 全选，或者把光标移到后面。
+// 约定：
+//   photo.png      -> 选中 "photo"
+//   archive.tar.gz -> 选中 "archive.tar"（按最后一个点切）
+//   .gitignore     -> 全选（点在开头，前面没有可选的名字）
+//   README         -> 全选（没有扩展名）
+function baseNameEnd(value: string): number {
+  const lastDot = value.lastIndexOf(".");
+  return lastDot > 0 ? lastDot : value.length;
 }
 
 function relativeTime(value: string | null): string {
@@ -191,9 +245,18 @@ export default function App() {
   });
   const [toast, setToast] = useState<ToastState | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const renameInput = useRef<HTMLInputElement>(null);
   const dirtyRef = useRef(false);
   const clipboardFocused = useRef(false);
   const toastId = useRef(0);
+  // 实测上行速度（字节/秒）的滑动平均，跨批次沿用，但有保质期。
+  const linkSpeed = useRef<number | null>(null);
+  const linkSpeedAt = useRef(0);
+  // 正在飞的请求，用来支持取消。
+  const activeUploads = useRef(new Map<string, XMLHttpRequest>());
+  const cancelled = useRef(new Set<string>());
+  // 所有上传（新批次和手动重试）共用一条队列，避免多批并发一起压垮弱网链路。
+  const uploadChain = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -203,6 +266,16 @@ export default function App() {
   useEffect(() => {
     dirtyRef.current = dirty;
   }, [dirty]);
+
+  // 进入重命名时聚焦并只选中主文件名。
+  // 放在 effect 里而不是 onFocus 里，是为了只在开始编辑那一次生效——
+  // 否则用户点回输入框想定位光标时，会被重新全选覆盖掉。
+  useEffect(() => {
+    const input = renameInput.current;
+    if (!editingId || !input) return;
+    input.focus();
+    input.setSelectionRange(0, baseNameEnd(input.value));
+  }, [editingId]);
 
   const notify = useCallback((message: string, kind: "success" | "error" = "success") => {
     const id = ++toastId.current;
@@ -278,30 +351,157 @@ export default function App() {
     setUploads((current) => current.map((task) => task.id === id ? { ...task, ...patch } : task));
   };
 
-  const uploadOne = (file: globalThis.File, taskId: string): Promise<void> => new Promise((resolve) => {
+  // 用实测上行速度的滑动平均驱动并发数，跨批次保留，第二批就不用再从 1 探起。
+  const noteLinkSpeed = (bytes: number, elapsedMs: number) => {
+    if (bytes <= 0 || elapsedMs <= 0) return;
+    const sample = bytes / (elapsedMs / 1000);
+    const previous = freshLinkSpeed();
+    linkSpeed.current = previous == null ? sample : previous * 0.6 + sample * 0.4;
+    linkSpeedAt.current = Date.now();
+  };
+
+  // 过期或刚失败过的测速结果一律不信，重新探路。
+  const freshLinkSpeed = (): number | null =>
+    Date.now() - linkSpeedAt.current <= SPEED_FRESH_MS ? linkSpeed.current : null;
+
+  const forgetLinkSpeed = () => {
+    linkSpeed.current = null;
+    linkSpeedAt.current = 0;
+  };
+
+  const sendOnce = (file: globalThis.File, taskId: string): Promise<UploadOutcome> => new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
+    const startedAt = Date.now();
+    let lastMovedAt = startedAt;
+    let sampleAt = startedAt;
+    let sampleLoaded = 0;
+    let stalled = false;
+
+    // XHR 自带的 timeout 是「总时长」，4 GiB 的文件慢慢传也会被它砍掉。
+    // 这里改成看「有没有字节在动」，只有真的卡死才中断。
+    const watchdog = window.setInterval(() => {
+      if (Date.now() - lastMovedAt < UPLOAD_STALL_MS) return;
+      stalled = true;
+      xhr.abort();
+    }, 5_000);
+
+    const settle = (outcome: UploadOutcome) => {
+      window.clearInterval(watchdog);
+      activeUploads.current.delete(taskId);
+      resolve(outcome);
+    };
+
+    activeUploads.current.set(taskId, xhr);
     xhr.open("POST", "/api/files");
     xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) updateUpload(taskId, { progress: Math.round(event.loaded / event.total * 100) });
+      const now = Date.now();
+      lastMovedAt = now;
+      if (!event.lengthComputable) return;
+      const patch: Partial<UploadTask> = { progress: Math.round(event.loaded / event.total * 100) };
+      if (now - sampleAt >= SPEED_SAMPLE_MS) {
+        patch.speed = (event.loaded - sampleLoaded) / ((now - sampleAt) / 1000);
+        sampleAt = now;
+        sampleLoaded = event.loaded;
+      }
+      updateUpload(taskId, patch);
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        updateUpload(taskId, { progress: 100, status: "done" });
-      } else {
-        let message = "上传失败";
-        try { message = JSON.parse(xhr.responseText).error || message; } catch { /* noop */ }
-        updateUpload(taskId, { status: "error", error: message });
+        noteLinkSpeed(file.size, Date.now() - startedAt);
+        settle({ ok: true });
+        return;
       }
-      resolve();
+      let message = `上传失败（${xhr.status}）`;
+      try { message = JSON.parse(xhr.responseText).error || message; } catch { /* noop */ }
+      // 网关类错误多半是链路抖动，值得重试；配额、体积、文件名这些服务器已经给出结论。
+      settle({ ok: false, message, retryable: xhr.status === 502 || xhr.status === 503 || xhr.status === 504 });
     };
-    xhr.onerror = () => {
-      updateUpload(taskId, { status: "error", error: "网络连接中断" });
-      resolve();
+    xhr.onerror = () => settle({ ok: false, message: "网络连接中断", retryable: true });
+    xhr.onabort = () => {
+      // 用户主动取消不该被自动重试；只有卡死中断才重试。
+      if (cancelled.current.has(taskId)) return settle({ ok: false, message: "已取消", retryable: false });
+      settle(stalled
+        ? { ok: false, message: `上传停滞超过 ${Math.round(UPLOAD_STALL_MS / 1000)} 秒`, retryable: true }
+        : { ok: false, message: "上传已中断", retryable: true });
     };
+
     const body = new FormData();
     body.append("file", file, file.name);
     xhr.send(body);
   });
+
+  const uploadOne = async (file: globalThis.File, taskId: string): Promise<boolean> => {
+    for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+      if (cancelled.current.has(taskId)) break;
+      updateUpload(taskId, { status: "uploading", progress: 0, error: undefined, retryable: undefined, speed: undefined });
+      const outcome = await sendOnce(file, taskId);
+      if (outcome.ok) {
+        updateUpload(taskId, { progress: 100, status: "done", error: undefined, speed: undefined });
+        return true;
+      }
+      if (cancelled.current.has(taskId)) break;
+      if (!outcome.retryable || attempt === UPLOAD_MAX_ATTEMPTS) {
+        updateUpload(taskId, { status: "error", error: outcome.message, retryable: outcome.retryable, speed: undefined });
+        return false;
+      }
+      // 退避期间把原因留在行里，用户能看到「为什么在等」。下一轮开头会清掉。
+      updateUpload(taskId, { error: `${outcome.message}，重试中（${attempt + 1}/${UPLOAD_MAX_ATTEMPTS}）`, speed: undefined });
+      await delay(attempt * 1500);
+    }
+    // 取消过的任务留一个可以手动重来的入口。
+    updateUpload(taskId, { status: "error", error: "已取消", retryable: true, speed: undefined });
+    return false;
+  };
+
+  const cancelUpload = (taskId: string) => {
+    cancelled.current.add(taskId);
+    activeUploads.current.get(taskId)?.abort();
+  };
+
+  // 自适应并发队列：网快就多开几路，一旦出现网络类失败立刻退回串行。
+  const runUploadQueue = (items: Array<{ file: globalThis.File; taskId: string }>): Promise<number> =>
+    new Promise((resolve) => {
+      let cursor = 0;
+      let active = 0;
+      let succeeded = 0;
+      let degraded = false;
+      // 每批都先用一个文件探路。上一批测到的速度不能证明这一刻链路还活着，
+      // 而一旦链路是死的，探路只赔上 1 个文件，而不是一次赔上一整批。
+      // 探路成功后立刻按实测速度提档，网好的时候这点代价可以忽略。
+      let target = 1;
+
+      const pump = () => {
+        if (cursor >= items.length && active === 0) {
+          resolve(succeeded);
+          return;
+        }
+        while (active < target && cursor < items.length) {
+          const item = items[cursor];
+          cursor += 1;
+          active += 1;
+          void uploadOne(item.file, item.taskId).then((ok) => {
+            active -= 1;
+            if (ok) {
+              succeeded += 1;
+              // 一路顺利就按最新实测速度重新定档，网好的时候能迅速开到上限。
+              if (!degraded && !prefersReducedData()) {
+                target = Math.max(target, Math.min(concurrencyForSpeed(freshLinkSpeed()), items.length));
+              }
+            } else {
+              // 失败就退回串行，把剩下的文件一个一个稳稳送上去，
+              // 并丢掉旧的测速结果——链路刚出过问题，之前那个「很快」已经不作数了。
+              degraded = true;
+              target = 1;
+              forgetLinkSpeed();
+            }
+            pump();
+          });
+        }
+      };
+
+      if (!items.length) resolve(0);
+      else pump();
+    });
 
   const addFiles = async (incoming: FileList | globalThis.File[]) => {
     const files = Array.from(incoming);
@@ -319,17 +519,45 @@ export default function App() {
       available -= file.size;
       return true;
     });
+    if (!accepted.length) return;
     const tasks = accepted.map((file) => ({
       id: crypto.randomUUID(),
       name: file.name,
       progress: 0,
       status: "uploading" as const,
+      file,
     }));
     setUploads((current) => [...tasks, ...current].slice(0, 12));
-    await Promise.all(accepted.map((file, index) => uploadOne(file, tasks[index].id)));
-    await loadState();
-    if (accepted.length) notify(`${accepted.length} 个文件已放入中转区`);
-    window.setTimeout(() => setUploads((current) => current.filter((task) => task.status !== "done")), 2200);
+
+    // 批次之间也要排队。否则连着拖两次文件，就变成两条队列各自并发，
+    // 弱网下又回到「一起发、一起失败」的老问题。
+    uploadChain.current = uploadChain.current.then(async () => {
+      const succeeded = await runUploadQueue(accepted.map((file, index) => ({ file, taskId: tasks[index].id })));
+      await loadState();
+      const failed = accepted.length - succeeded;
+      if (!failed) notify(`${succeeded} 个文件已放入中转区`);
+      else if (!succeeded) notify(`${failed} 个文件上传失败，可以点重试`, "error");
+      else notify(`${succeeded} 个已上传，${failed} 个失败，可以点重试`, "error");
+      window.setTimeout(() => setUploads((current) => current.filter((task) => task.status !== "done")), 2200);
+    });
+  };
+
+  const retryUpload = (taskId: string) => {
+    const task = uploads.find((item) => item.id === taskId);
+    if (!task || task.status === "uploading") return;
+    updateUpload(taskId, { status: "uploading", progress: 0, error: undefined });
+    uploadChain.current = uploadChain.current.then(async () => {
+      cancelled.current.delete(taskId);
+      const ok = await uploadOne(task.file, taskId);
+      await loadState();
+      notify(ok ? `${task.name} 已放入中转区` : `${task.name} 仍然失败`, ok ? "success" : "error");
+      if (ok) window.setTimeout(() => setUploads((current) => current.filter((item) => item.status !== "done")), 2200);
+    });
+  };
+
+  const dismissUpload = (taskId: string) => {
+    cancelled.current.delete(taskId);
+    setUploads((current) => current.filter((task) => task.id !== taskId));
   };
 
   const onClipboardPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -596,12 +824,39 @@ export default function App() {
             {uploads.map((task) => (
               <div className={`upload-task ${task.status}`} key={task.id}>
                 <div className="task-state">
-                  {task.status === "done" ? <Check size={15} /> : task.status === "error" ? <X size={15} /> : <LoaderCircle className="spin" size={15} />}
+                  {/* 失败用警告图标而不是 ✕：这里是状态指示，不是关闭按钮。
+                      右侧那个 ✕ 才是真正能点掉这条记录的。 */}
+                  {task.status === "done" ? <Check size={15} /> : task.status === "error" ? <TriangleAlert size={15} /> : <LoaderCircle className="spin" size={15} />}
                 </div>
                 <div className="task-main">
-                  <div><strong>{task.name}</strong><span>{task.error || `${task.progress}%`}</span></div>
+                  <div>
+                    <strong>{task.name}</strong>
+                    <span>
+                      {task.error
+                        || (task.speed ? `${task.progress}% · ${formatBytes(task.speed)}/s` : `${task.progress}%`)}
+                    </span>
+                  </div>
                   <div className="progress-track"><span style={{ width: `${task.progress}%` }} /></div>
                 </div>
+                {task.status !== "done" && (
+                  <div className="task-actions">
+                    {task.status === "uploading" && (
+                      <button onClick={() => cancelUpload(task.id)} aria-label={`取消上传 ${task.name}`} title="取消">
+                        <X size={14} />
+                      </button>
+                    )}
+                    {task.status === "error" && task.retryable && (
+                      <button onClick={() => retryUpload(task.id)} aria-label={`重试上传 ${task.name}`} title="重试">
+                        <RotateCcw size={14} />
+                      </button>
+                    )}
+                    {task.status === "error" && (
+                      <button onClick={() => dismissUpload(task.id)} aria-label={`不再显示 ${task.name}`} title="移除这条记录">
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -662,10 +917,10 @@ export default function App() {
               <div className="file-info">
                 {editingId === file.id ? (
                   <input
+                    ref={renameInput}
                     className="rename-input"
                     value={renameDraft}
                     onChange={(event) => setRenameDraft(event.target.value)}
-                    onFocus={(event) => event.currentTarget.select()}
                     onKeyDown={(event) => {
                       if (event.key === "Enter") {
                         event.preventDefault();
@@ -675,7 +930,6 @@ export default function App() {
                     }}
                     aria-label={`修改 ${file.name} 的文件名`}
                     maxLength={180}
-                    autoFocus
                   />
                 ) : <strong title={file.name}>{file.name}</strong>}
                 <span>{formatBytes(file.size)} · {relativeTime(file.createdAt)}</span>

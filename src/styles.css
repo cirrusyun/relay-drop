@@ -356,6 +356,20 @@ select:focus-visible,
 .progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--blue); transition: width 120ms linear; }
 .upload-task.done .progress-track span { background: var(--green); }
 .upload-task.error .progress-track span { background: var(--red); }
+.task-actions { display: flex; flex: 0 0 auto; gap: 4px; }
+.task-actions button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-faint);
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.task-actions button:hover { color: var(--ink); border-color: var(--ink-faint); }
 
 .list-toolbar {
   display: flex;
