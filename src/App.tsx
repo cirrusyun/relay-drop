@@ -34,6 +34,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { settleClipboardWrite } from "./clipboard";
 
 interface ClipboardState {
   content: string;
@@ -229,7 +230,11 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [dirty, setDirty] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "online" | "offline">("connecting");
+  const [lastConnectedAt, setLastConnectedAt] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [refreshingClipboard, setRefreshingClipboard] = useState(false);
+  const [confirmClipboardRefresh, setConfirmClipboardRefresh] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [uploads, setUploads] = useState<UploadTask[]>([]);
   const [query, setQuery] = useState("");
@@ -247,7 +252,12 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const renameInput = useRef<HTMLInputElement>(null);
   const dirtyRef = useRef(false);
+  const draftRef = useRef("");
+  const clipboardWritePending = useRef(false);
   const clipboardFocused = useRef(false);
+  const clipboardRefreshPending = useRef(false);
+  const stateRequestId = useRef(0);
+  const stateRequestAbort = useRef<AbortController | null>(null);
   const toastId = useRef(0);
   // 实测上行速度（字节/秒）的滑动平均，跨批次沿用，但有保质期。
   const linkSpeed = useRef<number | null>(null);
@@ -262,10 +272,6 @@ export default function App() {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     localStorage.setItem("relay-theme", dark ? "dark" : "light");
   }, [dark]);
-
-  useEffect(() => {
-    dirtyRef.current = dirty;
-  }, [dirty]);
 
   // 进入重命名时聚焦并只选中主文件名。
   // 放在 effect 里而不是 onFocus 里，是为了只在开始编辑那一次生效——
@@ -283,43 +289,117 @@ export default function App() {
     window.setTimeout(() => setToast((current) => current?.id === id ? null : current), 2800);
   }, []);
 
+  const markConnected = useCallback(() => {
+    setConnectionStatus("online");
+    setLastConnectedAt(new Date().toISOString());
+  }, []);
+
+  const invalidateStateRead = useCallback(() => {
+    stateRequestId.current += 1;
+    stateRequestAbort.current?.abort();
+    stateRequestAbort.current = null;
+  }, []);
+
   const loadState = useCallback(async (forceClipboard = false) => {
+    // 手动刷新期间暂停后台同步，并忽略更早请求的迟到响应。
+    if (clipboardWritePending.current || (clipboardRefreshPending.current && !forceClipboard)) return false;
+    if (stateRequestAbort.current) {
+      if (!forceClipboard) return false;
+      stateRequestAbort.current.abort();
+    }
+    const requestId = ++stateRequestId.current;
+    const controller = new AbortController();
+    stateRequestAbort.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
     try {
-      const next = await api<RelayState>("/api/state");
+      const next = await api<RelayState>("/api/state", {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (requestId !== stateRequestId.current) return false;
       setState(next);
+      markConnected();
       if (forceClipboard || (!dirtyRef.current && !clipboardFocused.current)) {
         setDraft(next.clipboard.content);
+        draftRef.current = next.clipboard.content;
+        dirtyRef.current = false;
         setDirty(false);
       }
+      return true;
     } catch (error) {
-      notify((error as Error).message, "error");
+      if (requestId === stateRequestId.current) {
+        setConnectionStatus("offline");
+        if (forceClipboard) notify("刷新失败，当前文字已保留，请稍后重试", "error");
+      }
+      return false;
     } finally {
-      setLoading(false);
+      window.clearTimeout(timeout);
+      if (requestId === stateRequestId.current) {
+        stateRequestAbort.current = null;
+        setLoading(false);
+      }
     }
-  }, [notify]);
+  }, [markConnected, notify]);
 
   useEffect(() => {
-    void loadState(true);
+    void loadState();
     const timer = window.setInterval(() => void loadState(), 10_000);
-    return () => window.clearInterval(timer);
-  }, [loadState]);
+    const offline = () => setConnectionStatus("offline");
+    const online = () => { void loadState(); };
+    window.addEventListener("offline", offline);
+    window.addEventListener("online", online);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("offline", offline);
+      window.removeEventListener("online", online);
+      invalidateStateRead();
+    };
+  }, [invalidateStateRead, loadState]);
+
+  const refreshClipboard = async (discardDraft = false) => {
+    if (clipboardWritePending.current || clipboardRefreshPending.current) return;
+    if (dirtyRef.current && !discardDraft) {
+      setConfirmClipboardRefresh(true);
+      return;
+    }
+    setConfirmClipboardRefresh(false);
+    clipboardRefreshPending.current = true;
+    setRefreshingClipboard(true);
+    try {
+      if (await loadState(true)) notify("已获取最新剪贴板");
+    } finally {
+      clipboardRefreshPending.current = false;
+      setRefreshingClipboard(false);
+    }
+  };
 
   const saveClipboard = useCallback(async () => {
+    if (clipboardRefreshPending.current || clipboardWritePending.current) return;
+    clipboardWritePending.current = true;
+    invalidateStateRead();
+    const submittedDraft = draftRef.current;
+    setConfirmClipboardRefresh(false);
     setSaving(true);
     try {
       const result = await api<{ clipboard: ClipboardState }>("/api/clipboard", {
         method: "PUT",
-        body: JSON.stringify({ content: draft }),
+        body: JSON.stringify({ content: submittedDraft }),
       });
+      const settled = settleClipboardWrite(draftRef.current, submittedDraft, result.clipboard.content);
+      draftRef.current = settled.draft;
+      dirtyRef.current = settled.dirty;
+      setDraft(settled.draft);
+      setDirty(settled.dirty);
       setState((current) => ({ ...current, clipboard: result.clipboard }));
-      setDirty(false);
-      notify("剪贴板已同步到所有设备");
+      markConnected();
+      notify(settled.dirty ? "已保存，新增文字尚未同步" : "剪贴板已同步到所有设备");
     } catch (error) {
       notify((error as Error).message, "error");
     } finally {
+      clipboardWritePending.current = false;
       setSaving(false);
     }
-  }, [draft, notify]);
+  }, [invalidateStateRead, markConnected, notify]);
 
   const copyClipboard = async () => {
     if (!draft) return notify("剪贴板还是空的", "error");
@@ -332,17 +412,27 @@ export default function App() {
   };
 
   const clearClipboard = async () => {
+    if (clipboardRefreshPending.current || clipboardWritePending.current) return;
     if (draft && !window.confirm("清空后，其他设备也会看到空白剪贴板。继续吗？")) return;
+    clipboardWritePending.current = true;
+    invalidateStateRead();
+    const submittedDraft = draftRef.current;
+    setConfirmClipboardRefresh(false);
     setSaving(true);
     try {
       const result = await api<{ clipboard: ClipboardState }>("/api/clipboard", { method: "DELETE" });
-      setDraft("");
-      setDirty(false);
+      const settled = settleClipboardWrite(draftRef.current, submittedDraft, result.clipboard.content);
+      draftRef.current = settled.draft;
+      dirtyRef.current = settled.dirty;
+      setDraft(settled.draft);
+      setDirty(settled.dirty);
       setState((current) => ({ ...current, clipboard: result.clipboard }));
-      notify("共享剪贴板已清空");
+      markConnected();
+      notify(settled.dirty ? "云端已清空，新增文字已保留" : "共享剪贴板已清空");
     } catch (error) {
       notify((error as Error).message, "error");
     } finally {
+      clipboardWritePending.current = false;
       setSaving(false);
     }
   };
@@ -393,6 +483,7 @@ export default function App() {
 
     activeUploads.current.set(taskId, xhr);
     xhr.open("POST", "/api/files");
+    xhr.setRequestHeader("Idempotency-Key", taskId);
     xhr.upload.onprogress = (event) => {
       const now = Date.now();
       lastMovedAt = now;
@@ -412,9 +503,10 @@ export default function App() {
         return;
       }
       let message = `上传失败（${xhr.status}）`;
-      try { message = JSON.parse(xhr.responseText).error || message; } catch { /* noop */ }
+      let code = "";
+      try { const data = JSON.parse(xhr.responseText); message = data.error || message; code = data.code || ""; } catch { /* noop */ }
       // 网关类错误多半是链路抖动，值得重试；配额、体积、文件名这些服务器已经给出结论。
-      settle({ ok: false, message, retryable: xhr.status === 502 || xhr.status === 503 || xhr.status === 504 });
+      settle({ ok: false, message, retryable: [502, 503, 504].includes(xhr.status) || (xhr.status === 409 && code === "UPLOAD_IN_PROGRESS") });
     };
     xhr.onerror = () => settle({ ok: false, message: "网络连接中断", retryable: true });
     xhr.onabort = () => {
@@ -513,7 +605,7 @@ export default function App() {
         return false;
       }
       if (file.size > available) {
-        notify(`${file.name} 会超过共享空间的 20 GiB 上限`, "error");
+        notify(`${file.name} 会超过共享空间的 ${formatBytes(state.storage.maxBytes)} 上限`, "error");
         return false;
       }
       available -= file.size;
@@ -720,7 +812,9 @@ export default function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <div className="connection"><span />已连接共享空间</div>
+          <div className={`connection is-${connectionStatus}`} role="status" title={lastConnectedAt ? `最近连接成功：${relativeTime(lastConnectedAt)}` : "尚未连接成功"}>
+            <span />{connectionStatus === "online" ? "已连接共享空间" : connectionStatus === "connecting" ? "正在连接" : "连接中断，正在重试"}
+          </div>
           <button className="icon-button" onClick={() => setDark((value) => !value)} aria-label="切换明暗主题">
             {dark ? <Sun size={18} /> : <Moon size={18} />}
           </button>
@@ -736,21 +830,49 @@ export default function App() {
               <p>{dirty ? "有改动尚未保存" : `上次同步：${relativeTime(state.clipboard.updatedAt)}`}</p>
             </div>
           </div>
-          <div className={`save-state ${dirty ? "is-dirty" : ""}`}>
-            <span />{dirty ? "待同步" : "已同步"}
+          <div className="clipboard-actions">
+            <div className={`save-state ${dirty || connectionStatus === "offline" ? "is-dirty" : ""}`}>
+              <span />{refreshingClipboard ? "刷新中" : saving ? "保存中" : dirty ? "待同步" : connectionStatus === "offline" ? "未连接" : connectionStatus === "connecting" ? "连接中" : "已同步"}
+            </div>
+            <button
+              className="icon-button"
+              onClick={() => void refreshClipboard()}
+              disabled={saving || refreshingClipboard}
+              aria-label="刷新剪贴板"
+              aria-busy={refreshingClipboard}
+              title="获取最新剪贴板"
+            >
+              <RefreshCw className={refreshingClipboard ? "spin" : undefined} size={17} />
+            </button>
           </div>
         </div>
 
+        {confirmClipboardRefresh && (
+          <div className="clipboard-refresh-confirm" role="alert">
+            <p>有未保存的文字，刷新会用云端内容替换。</p>
+            <div className="refresh-confirm-buttons">
+              <button className="button secondary" onClick={() => setConfirmClipboardRefresh(false)}>取消</button>
+              <button className="button secondary" onClick={() => void refreshClipboard(true)}>放弃修改并刷新</button>
+            </div>
+          </div>
+        )}
+
         <textarea
           value={draft}
-          onChange={(event) => { setDraft(event.target.value); setDirty(event.target.value !== state.clipboard.content); }}
+          readOnly={refreshingClipboard}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            draftRef.current = event.target.value;
+            dirtyRef.current = event.target.value !== state.clipboard.content;
+            setDirty(dirtyRef.current);
+          }}
           onPaste={onClipboardPaste}
           onFocus={() => { clipboardFocused.current = true; }}
           onBlur={() => { clipboardFocused.current = false; }}
           onKeyDown={(event) => {
             if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
               event.preventDefault();
-              if (dirty && !saving) void saveClipboard();
+              if (dirty && !saving && !refreshingClipboard) void saveClipboard();
             }
           }}
           placeholder={"粘贴命令、网址、地址或一段临时文字…\n也可以直接粘贴截图或图片，自动放入下方文件区\n\n⌘ / Ctrl + Enter 快速保存"}
@@ -761,13 +883,13 @@ export default function App() {
         <div className="clipboard-footer">
           <span>{draft.length.toLocaleString("zh-CN")} 个字符 · 支持直接粘贴截图</span>
           <div className="button-row">
-            <button className="button ghost danger-ghost" onClick={() => void clearClipboard()} disabled={saving || (!draft && !state.clipboard.content)}>
+            <button className="button ghost danger-ghost" onClick={() => void clearClipboard()} disabled={saving || refreshingClipboard || (!draft && !state.clipboard.content)}>
               <Trash2 size={16} /> 清空
             </button>
             <button className="button secondary" onClick={() => void copyClipboard()} disabled={!draft}>
               <Copy size={16} /> 复制
             </button>
-            <button className="button primary" onClick={() => void saveClipboard()} disabled={!dirty || saving}>
+            <button className="button primary" onClick={() => void saveClipboard()} disabled={!dirty || saving || refreshingClipboard}>
               {saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
               {saving ? "保存中" : "保存并同步"}
             </button>

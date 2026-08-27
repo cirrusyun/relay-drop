@@ -2,25 +2,29 @@ import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
 import { createReadStream, createWriteStream } from "node:fs";
-import { rename, rm, stat } from "node:fs/promises";
+import { open, rename, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import sharp from "sharp";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { normalizeFilename, RelayStore, type FileRecord } from "./store.js";
+import { normalizeFilename, RelayStore, UUID_PATTERN, type FileRecord } from "./store.js";
 
 interface BuildOptions {
   dataDir?: string;
   maxUploadBytes?: number;
   maxStorageBytes?: number;
   serveFrontend?: boolean;
+  minFreeDiskBytes?: number;
+  freeDiskBytes?: () => Promise<number>;
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_STORAGE_BYTES = 20 * 1024 * 1024 * 1024;
 const MAX_CLIPBOARD_CHARACTERS = 1_000_000;
 const THUMBNAIL_RESERVATION_BYTES = 128 * 1024;
+const DEFAULT_MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024;
+const DISK_CHECK_BYTES = 1024 * 1024;
 const THUMBNAIL_IMAGE_TYPES = new Set([
   "image/avif",
   "image/gif",
@@ -28,6 +32,26 @@ const THUMBNAIL_IMAGE_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
+
+async function hasRasterSignature(filePath: string): Promise<boolean> {
+  const input = await open(filePath, "r");
+  try {
+    const bytes = Buffer.alloc(64);
+    const { bytesRead } = await input.read(bytes, 0, bytes.length, 0);
+    const header = bytes.subarray(0, bytesRead);
+    if (header.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return true;
+    if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return true;
+    if (["GIF87a", "GIF89a"].includes(header.subarray(0, 6).toString("ascii"))) return true;
+    if (header.subarray(0, 4).toString("ascii") === "RIFF" && header.subarray(8, 12).toString("ascii") === "WEBP") return true;
+    if (header.subarray(4, 8).toString("ascii") === "ftyp") {
+      const boxEnd = Math.min(bytesRead, header.readUInt32BE(0));
+      for (let offset = 8; offset + 4 <= boxEnd; offset += 4) {
+        if (offset !== 12 && ["avif", "avis"].includes(header.subarray(offset, offset + 4).toString("ascii"))) return true;
+      }
+    }
+    return false;
+  } finally { await input.close(); }
+}
 
 sharp.cache({ files: 0, items: 32, memory: 32 });
 sharp.concurrency(1);
@@ -74,8 +98,9 @@ function contentDisposition(name: string, disposition: "attachment" | "inline" =
 }
 
 function publicFile(file: FileRecord) {
-  const { storedName: _storedName, ...safe } = file;
-  return safe;
+  // Only the display fields belong in API responses, not storage or retry metadata.
+  const { id, name, size, mime, createdAt, expiresAt } = file;
+  return { id, name, size, mime, createdAt, expiresAt };
 }
 
 function publicFileWithThumbnail(file: FileRecord, hasThumbnail: boolean) {
@@ -95,16 +120,43 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
   const serveFrontend = options.serveFrontend ?? process.env.NODE_ENV === "production";
   const store = new RelayStore(dataDir);
   await store.init();
-  const thumbnailBytes = await store.totalThumbnailBytes();
-  const quota = new QuotaTracker(
-    maxStorageBytes,
-    store.snapshot().files.reduce((sum, file) => sum + file.size, thumbnailBytes),
-  );
+  const recovery = await store.reconcileStorage();
+  const quota = new QuotaTracker(maxStorageBytes, await store.storageBytes());
+  const minFreeDiskBytes = options.minFreeDiskBytes ?? positiveInteger(process.env.MIN_FREE_DISK_BYTES, DEFAULT_MIN_FREE_DISK_BYTES);
+  const freeDiskBytes = options.freeDiskBytes ?? (async () => {
+    const disk = await statfs(dataDir);
+    return disk.bavail * disk.bsize;
+  });
+  const ensureDiskSpace = async (incomingBytes = 0) => {
+    // Recheck during streaming; the small margin covers buffered writes between checks.
+    if (await freeDiskBytes() < minFreeDiskBytes + DISK_CHECK_BYTES + incomingBytes) {
+      throw Object.assign(new Error("服务器磁盘可用空间不足，已暂停上传，请先释放空间。"), {
+        code: "DISK_SPACE_LOW", statusCode: 507,
+      });
+    }
+  };
 
   const app = Fastify({
     logger: process.env.NODE_ENV !== "test",
     bodyLimit: 1_100_000,
     trustProxy: true,
+  });
+  if (Object.values(recovery).some(Boolean)) app.log.info(recovery, "Storage recovery completed");
+
+  app.addHook("onRequest", async (request, reply) => {
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return;
+    const origin = request.headers.origin;
+    let trustedOrigin = true;
+    if (origin !== undefined) {
+      try {
+        const source = new URL(origin);
+        const target = new URL(`${request.protocol}://${request.headers.host}`);
+        trustedOrigin = source.origin !== "null" && source.origin === target.origin;
+      } catch { trustedOrigin = false; }
+    }
+    if (!trustedOrigin || request.headers["sec-fetch-site"] === "cross-site") {
+      return reply.code(403).send({ error: "已拒绝来自其他网站的操作。" });
+    }
   });
 
   let thumbnailQueue = Promise.resolve();
@@ -116,6 +168,9 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
       const temporaryPath = `${store.thumbnailPath(file)}.uploading`;
       let reservedBytes = 0;
       try {
+        // MIME is supplied by the uploader; do not feed disguised SVG/PDF documents to the image decoder.
+        if (!(await hasRasterSignature(store.filePath(file)))) return false;
+        await ensureDiskSpace(THUMBNAIL_RESERVATION_BYTES);
         if (!quota.claim(THUMBNAIL_RESERVATION_BYTES)) return false;
         reservedBytes = THUMBNAIL_RESERVATION_BYTES;
         await sharp(store.filePath(file), {
@@ -174,7 +229,8 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
 
   app.get("/api/health", async () => ({ ok: true }));
 
-  app.get("/api/state", async () => {
+  app.get("/api/state", async (_request, reply) => {
+    reply.header("Cache-Control", "private, no-store");
     const snapshot = store.snapshot();
     return {
       clipboard: snapshot.clipboard,
@@ -199,18 +255,35 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
 
   app.delete("/api/clipboard", async () => ({ clipboard: await store.saveClipboard("") }));
 
+  const activeUploadKeys = new Set<string>();
   app.post("/api/files", async (request, reply) => {
-    const part = await request.file();
-    if (!part) return reply.code(400).send({ error: "没有收到文件。" });
-
+    const uploadKey = request.headers["idempotency-key"];
+    if (uploadKey !== undefined && (typeof uploadKey !== "string" || !UUID_PATTERN.test(uploadKey))) {
+      return reply.code(400).send({ error: "无效的上传标识。" });
+    }
+    if (uploadKey) {
+      const existing = store.getFileByUploadKey(uploadKey);
+      if (existing) {
+        request.raw.resume();
+        if (!(await store.verifyFile(existing))) return reply.code(409).send({ error: "原文件已不可用，请重新选择文件上传。" });
+        return { file: publicFileWithThumbnail(existing, Boolean(await store.thumbnailSize(existing))) };
+      }
+      if (activeUploadKeys.has(uploadKey)) {
+        request.raw.resume();
+        return reply.code(409).header("Retry-After", "2").send({ error: "同一文件仍在处理中，请稍后重试。", code: "UPLOAD_IN_PROGRESS" });
+      }
+      activeUploadKeys.add(uploadKey);
+    }
     const storedName = store.newStoredName();
     const temporaryPath = path.join(store.filesDir, `${storedName}.uploading`);
     const finalPath = path.join(store.filesDir, storedName);
     let claimedBytes = 0;
+    let committed = false;
+    let bytesSinceDiskCheck = 0;
     const quotaGuard = new Transform({
       transform(chunk: Buffer, _encoding, callback) {
         if (!quota.claim(chunk.length)) {
-          const error = Object.assign(new Error("共享空间已达到 20 GiB 存储上限。"), {
+          const error = Object.assign(new Error("共享空间已达到存储上限。"), {
             code: "STORAGE_QUOTA_EXCEEDED",
             statusCode: 507,
           });
@@ -218,11 +291,18 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
           return;
         }
         claimedBytes += chunk.length;
-        callback(null, chunk);
+        bytesSinceDiskCheck += chunk.length;
+        if (bytesSinceDiskCheck >= DISK_CHECK_BYTES) {
+          bytesSinceDiskCheck = 0;
+          ensureDiskSpace(chunk.length).then(() => callback(null, chunk), (error) => callback(error));
+        } else callback(null, chunk);
       },
     });
 
     try {
+      await ensureDiskSpace();
+      const part = await request.file();
+      if (!part) return reply.code(400).send({ error: "没有收到文件。" });
       await pipeline(
         part.file,
         quotaGuard,
@@ -244,7 +324,9 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
         mime: String(part.mimetype || "application/octet-stream").slice(0, 160),
         createdAt,
         expiresAt: null,
+        ...(uploadKey ? { uploadKey } : {}),
       });
+      committed = true;
       quota.commit(claimedBytes);
       claimedBytes = 0;
       const hasThumbnail = await ensureThumbnail(file);
@@ -252,8 +334,11 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
     } catch (error) {
       quota.release(claimedBytes);
       await rm(temporaryPath, { force: true });
-      await rm(finalPath, { force: true });
+      // A thumbnail or response failure must never remove an already committed original.
+      if (!committed) await rm(finalPath, { force: true });
       throw error;
+    } finally {
+      if (uploadKey) activeUploadKeys.delete(uploadKey);
     }
   });
 
@@ -307,9 +392,7 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
     await thumbnailQueue;
     const removed = await store.deleteFiles(ids as string[]);
     if (!removed.files.length) return reply.code(404).send({ error: "所选文件已不存在。" });
-    quota.removeCommitted(
-      removed.files.reduce((sum, file) => sum + file.size, removed.thumbnailBytes),
-    );
+    quota.removeCommitted(removed.removedBytes);
     return {
       removedIds: removed.files.map((file) => file.id),
       storage: { usedBytes: quota.usedBytes, maxBytes: quota.maxBytes },
@@ -324,7 +407,7 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
     await thumbnailQueue;
     const removed = await store.deleteFiles([request.params.id]);
     if (!removed.files.length) return reply.code(404).send({ error: "文件不存在。" });
-    quota.removeCommitted(file.size + removed.thumbnailBytes);
+    quota.removeCommitted(removed.removedBytes);
     return reply.code(204).send();
   });
 
@@ -333,8 +416,11 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
     if (error instanceof app.multipartErrors.RequestFileTooLargeError) {
       return reply.code(413).send({ error: "文件超过了服务器允许的大小。" });
     }
-    if (appError.code === "STORAGE_QUOTA_EXCEEDED") {
+    if (appError.code === "STORAGE_QUOTA_EXCEEDED" || appError.code === "DISK_SPACE_LOW") {
       return reply.code(507).send({ error: appError.message });
+    }
+    if (appError.code === "ENOSPC") {
+      return reply.code(507).send({ error: "服务器磁盘空间不足，请先释放空间后重试。" });
     }
     app.log.error(error);
     const status = appError.statusCode && appError.statusCode < 500 ? appError.statusCode : 500;
@@ -361,7 +447,9 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
 async function start() {
   const app = await buildApp();
   const port = positiveInteger(process.env.PORT, 8787);
-  await app.listen({ host: "0.0.0.0", port });
+  // Docker publishes this port on loopback; unauthenticated local development stays local too.
+  const host = process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1";
+  await app.listen({ host, port });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

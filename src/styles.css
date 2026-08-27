@@ -147,6 +147,9 @@ select:focus-visible,
   background: var(--green);
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 12%, transparent);
 }
+.connection.is-offline { color: var(--amber); }
+.connection.is-offline span { background: var(--amber); box-shadow: 0 0 0 4px var(--amber-soft); }
+.connection.is-connecting span { background: var(--ink-faint); box-shadow: none; }
 
 .icon-button, .file-action {
   display: inline-grid;
@@ -162,6 +165,7 @@ select:focus-visible,
   border-radius: 11px;
 }
 .icon-button:hover, .file-action:hover { border-color: var(--line-strong); background: var(--surface-hover); transform: translateY(-1px); }
+.icon-button:disabled { cursor: not-allowed; opacity: 0.55; transform: none; }
 
 .card {
   margin-top: 18px;
@@ -193,12 +197,30 @@ select:focus-visible,
 .heading-copy h2 { margin: 0 0 3px; font-size: 16px; letter-spacing: -0.02em; }
 .heading-copy p { margin: 0; color: var(--ink-faint); font-size: 12px; }
 
+.clipboard-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.clipboard-refresh-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 26px 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 25%, var(--line));
+  border-radius: 12px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 12px;
+}
+.clipboard-refresh-confirm p { margin: 0; }
+.refresh-confirm-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 .save-state {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   color: var(--green);
   font-size: 12px;
+  white-space: nowrap;
 }
 .save-state span { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .save-state.is-dirty { color: var(--amber); }
@@ -515,6 +537,7 @@ footer span { gap: 5px; }
   .card { border-radius: 18px; }
   .card-heading { padding: 20px 18px 16px; }
   .save-state { font-size: 10px; }
+  .clipboard-refresh-confirm { margin-inline: 18px; }
   .storage-copy { min-width: 82px; }
   .storage-track { width: 82px; }
   .clipboard-card textarea { width: calc(100% - 36px); min-height: 210px; margin: 0 18px; padding: 16px; }

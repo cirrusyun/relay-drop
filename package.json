@@ -10,10 +10,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "concurrently --kill-others --names web,api \"vite --host 0.0.0.0\" \"tsx watch server/index.ts\"",
+    "dev": "concurrently --kill-others --names web,api \"vite --host 127.0.0.1\" \"tsx watch server/index.ts\"",
     "build": "vite build && tsc -p tsconfig.server.json",
     "start": "node dist-server/index.js",
-    "test": "tsx --test server/index.test.ts",
+    "test": "tsx --test server/*.test.ts tests/*.test.ts",
     "lint": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
   },
   "dependencies": {
@@ -33,6 +33,6 @@
     "concurrently": "^10.0.4",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3",
-    "vite": "^8.0.13"
+    "vite": "^8.2.2"
   }
 }
