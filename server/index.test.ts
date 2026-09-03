@@ -92,12 +92,55 @@ test("shared clipboard, file lifecycle, safe names, and storage quota", async ()
     const thumbnailBytes = (await thumbnail.arrayBuffer()).byteLength;
     assert.ok(thumbnailBytes > 0 && thumbnailBytes < 10_000);
 
+    const preview = await fetch(`${address}/api/files/${image.file.id}/preview`);
+    assert.equal(preview.status, 200);
+    assert.equal(preview.headers.get("content-type"), "image/png");
+    assert.match(preview.headers.get("content-disposition") || "", /^inline;/);
+    assert.equal(preview.headers.get("cache-control"), "private, no-store");
+    assert.equal(preview.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(preview.headers.get("content-security-policy"), "default-src 'none'; sandbox");
+    assert.deepEqual(Buffer.from(await preview.arrayBuffer()), png);
+
     const withThumbnail = await (await fetch(`${address}/api/state`)).json() as any;
     assert.equal(withThumbnail.files.find((file: any) => file.id === image.file.id).hasThumbnail, true);
     assert.equal(withThumbnail.storage.usedBytes, 5 + png.length + thumbnailBytes);
 
     const missingThumbnail = await fetch(`${address}/api/files/${uploaded.file.id}/thumbnail`);
     assert.equal(missingThumbnail.status, 404);
+
+    const duplicateRename = await fetch(`${address}/api/files/${image.file.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "renamed.txt" }),
+    });
+    assert.equal(duplicateRename.status, 200);
+
+    const archiveTicket = await fetch(`${address}/api/files/archive`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: [uploaded.file.id, image.file.id] }),
+    });
+    assert.equal(archiveTicket.status, 201);
+    assert.equal(archiveTicket.headers.get("cache-control"), "private, no-store");
+    const archiveUrl = (await archiveTicket.json() as any).url as string;
+    assert.match(archiveUrl, /^\/api\/files\/archive\/[a-f0-9-]{36}$/);
+    const archiveDownload = await fetch(`${address}${archiveUrl}`);
+    assert.equal(archiveDownload.status, 200);
+    assert.equal(archiveDownload.headers.get("content-type"), "application/zip");
+    assert.match(archiveDownload.headers.get("content-disposition") || "", /^attachment;/);
+    assert.equal(archiveDownload.headers.get("cache-control"), "private, no-store");
+    const archiveBytes = Buffer.from(await archiveDownload.arrayBuffer());
+    assert.equal(archiveBytes.subarray(0, 4).toString("hex"), "504b0304");
+    assert.ok(archiveBytes.includes(Buffer.from("renamed.txt")));
+    assert.ok(archiveBytes.includes(Buffer.from("renamed (2).txt")));
+    assert.equal((await fetch(`${address}${archiveUrl}`)).status, 404);
+
+    const invalidArchive = await fetch(`${address}/api/files/archive`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: [uploaded.file.id, uploaded.file.id] }),
+    });
+    assert.equal(invalidArchive.status, 400);
 
     const secondBody = new FormData();
     secondBody.append("file", new Blob([Buffer.alloc(200_000)], { type: "text/plain" }), "second.txt");

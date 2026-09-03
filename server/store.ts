@@ -40,7 +40,7 @@ async function sizeOnDisk(file: string): Promise<number> {
   }
 }
 
-async function directoryBytes(directory: string): Promise<number> {
+export async function directoryBytes(directory: string): Promise<number> {
   let bytes = 0;
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const target = path.join(directory, entry.name);

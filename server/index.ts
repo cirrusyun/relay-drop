@@ -5,10 +5,13 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { open, rename, rm, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { ZipArchive } from "archiver";
 import sharp from "sharp";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { normalizeFilename, RelayStore, UUID_PATTERN, type FileRecord } from "./store.js";
+import { NotebookStore, type NoteReservation } from "./notes.js";
 
 interface BuildOptions {
   dataDir?: string;
@@ -25,6 +28,8 @@ const MAX_CLIPBOARD_CHARACTERS = 1_000_000;
 const THUMBNAIL_RESERVATION_BYTES = 128 * 1024;
 const DEFAULT_MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024;
 const DISK_CHECK_BYTES = 1024 * 1024;
+const ARCHIVE_TICKET_TTL_MS = 60_000;
+const MAX_ARCHIVE_TICKETS = 128;
 const THUMBNAIL_IMAGE_TYPES = new Set([
   "image/avif",
   "image/gif",
@@ -97,6 +102,25 @@ function contentDisposition(name: string, disposition: "attachment" | "inline" =
   return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
+function uniqueArchiveNames(files: FileRecord[]): Map<string, string> {
+  const names = new Map<string, string>();
+  const used = new Set<string>();
+  for (const file of files) {
+    let name = normalizeFilename(file.name);
+    if (name === "." || name === "..") name = "未命名文件";
+    const dot = name.lastIndexOf(".");
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const extension = dot > 0 ? name.slice(dot) : "";
+    let candidate = name;
+    for (let copy = 2; used.has(candidate.toLowerCase()); copy += 1) {
+      candidate = `${stem} (${copy})${extension}`;
+    }
+    used.add(candidate.toLowerCase());
+    names.set(file.id, candidate);
+  }
+  return names;
+}
+
 function publicFile(file: FileRecord) {
   // Only the display fields belong in API responses, not storage or retry metadata.
   const { id, name, size, mime, createdAt, expiresAt } = file;
@@ -121,7 +145,9 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
   const store = new RelayStore(dataDir);
   await store.init();
   const recovery = await store.reconcileStorage();
-  const quota = new QuotaTracker(maxStorageBytes, await store.storageBytes());
+  const notes = new NotebookStore(dataDir);
+  await notes.init();
+  const quota = new QuotaTracker(maxStorageBytes, await store.storageBytes() + await notes.storageBytes());
   const minFreeDiskBytes = options.minFreeDiskBytes ?? positiveInteger(process.env.MIN_FREE_DISK_BYTES, DEFAULT_MIN_FREE_DISK_BYTES);
   const freeDiskBytes = options.freeDiskBytes ?? (async () => {
     const disk = await statfs(dataDir);
@@ -141,6 +167,7 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
     bodyLimit: 1_100_000,
     trustProxy: true,
   });
+  const archiveTickets = new Map<string, { ids: string[]; expiresAt: number }>();
   if (Object.values(recovery).some(Boolean)) app.log.info(recovery, "Storage recovery completed");
 
   app.addHook("onRequest", async (request, reply) => {
@@ -255,6 +282,52 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
 
   app.delete("/api/clipboard", async () => ({ clipboard: await store.saveClipboard("") }));
 
+  const reserveNote: NoteReservation = async (delta, temporaryBytes) => {
+    await ensureDiskSpace(temporaryBytes);
+    const growth = Math.max(0, delta);
+    if (!quota.claim(growth)) throw Object.assign(new Error("共享空间已达到存储上限。"), { code: "STORAGE_QUOTA_EXCEEDED", statusCode: 507 });
+    return {
+      commit() { if (delta >= 0) quota.commit(growth); else quota.removeCommitted(-delta); },
+      rollback() { quota.release(growth); },
+    };
+  };
+  type NoteBody = { id?: unknown; title?: unknown; content?: unknown; attachments?: unknown };
+  const validNoteBody = (body: NoteBody | undefined) => body && typeof body.content === "string"
+    && body.content.length <= MAX_CLIPBOARD_CHARACTERS
+    && (body.title === undefined || (typeof body.title === "string" && body.title.length <= 500))
+    && (body.attachments === undefined || (Array.isArray(body.attachments) && body.attachments.length <= 30
+      && new Set(body.attachments).size === body.attachments.length
+      && body.attachments.every((id) => typeof id === "string" && UUID_PATTERN.test(id)
+        && THUMBNAIL_IMAGE_TYPES.has(store.getFile(id)?.mime ?? ""))));
+
+  app.get("/api/notes", async (_request, reply) => {
+    reply.header("Cache-Control", "private, no-store");
+    return { notes: notes.list() };
+  });
+  app.get<{ Params: { id: string } }>("/api/notes/:id", async (request, reply) => {
+    reply.header("Cache-Control", "private, no-store");
+    const note = await notes.get(request.params.id);
+    return note ? { note } : reply.code(404).send({ error: "笔记不存在。" });
+  });
+  app.post<{ Body: NoteBody }>("/api/notes", async (request, reply) => {
+    if (!validNoteBody(request.body)) return reply.code(400).send({ error: "笔记内容或标题格式不正确。" });
+    const id = request.body.id ?? randomUUID();
+    if (typeof id !== "string" || !UUID_PATTERN.test(id)) return reply.code(400).send({ error: "无效的笔记标识。" });
+    const result = await notes.save(id, String(request.body.title ?? ""), request.body.content as string, true, reserveNote, request.body.attachments as string[] | undefined);
+    return reply.code(result.created ? 201 : 200).send({ note: result.note });
+  });
+  app.put<{ Params: { id: string }; Body: NoteBody }>("/api/notes/:id", async (request, reply) => {
+    if (!validNoteBody(request.body)) return reply.code(400).send({ error: "笔记内容或标题格式不正确。" });
+    const result = await notes.save(request.params.id, String(request.body.title ?? ""), request.body.content as string, false, reserveNote, request.body.attachments as string[] | undefined);
+    return { note: result.note };
+  });
+  app.delete<{ Params: { id: string } }>("/api/notes/:id", async (request, reply) => {
+    const removedBytes = await notes.delete(request.params.id);
+    if (removedBytes === undefined) return reply.code(404).send({ error: "笔记不存在。" });
+    quota.removeCommitted(removedBytes);
+    return reply.code(204).send();
+  });
+
   const activeUploadKeys = new Set<string>();
   app.post("/api/files", async (request, reply) => {
     const uploadKey = request.headers["idempotency-key"];
@@ -355,6 +428,88 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
     return reply.send(createReadStream(store.filePath(file)));
   });
 
+  app.post<{ Body: { ids?: unknown } }>("/api/files/archive", async (request, reply) => {
+    const requestedIds = request.body?.ids;
+    if (!Array.isArray(requestedIds) || requestedIds.length < 2 || requestedIds.length > 2_000) {
+      return reply.code(400).send({ error: "请选择 2 到 2000 个要下载的文件。" });
+    }
+    const ids = [...new Set(requestedIds)];
+    if (ids.length < 2 || ids.some((id) => typeof id !== "string" || !UUID_PATTERN.test(id))) {
+      return reply.code(400).send({ error: "文件列表中包含无效项目。" });
+    }
+    const files = ids.map((id) => store.getFile(id as string));
+    const filesExist = await Promise.all(files.map((file) => file ? store.verifyFile(file) : false));
+    if (filesExist.some((exists) => !exists)) {
+      return reply.code(404).send({ error: "部分所选文件已不存在，请刷新后重试。" });
+    }
+
+    const now = Date.now();
+    for (const [token, ticket] of archiveTickets) {
+      if (ticket.expiresAt <= now) archiveTickets.delete(token);
+    }
+    while (archiveTickets.size >= MAX_ARCHIVE_TICKETS) {
+      const oldest = archiveTickets.keys().next().value as string | undefined;
+      if (!oldest) break;
+      archiveTickets.delete(oldest);
+    }
+    const token = randomUUID();
+    archiveTickets.set(token, { ids: ids as string[], expiresAt: now + ARCHIVE_TICKET_TTL_MS });
+    reply.header("Cache-Control", "private, no-store");
+    return reply.code(201).send({ url: `/api/files/archive/${token}` });
+  });
+
+  app.get<{ Params: { token: string } }>("/api/files/archive/:token", async (request, reply) => {
+    const ticket = archiveTickets.get(request.params.token);
+    archiveTickets.delete(request.params.token);
+    if (!ticket || ticket.expiresAt <= Date.now()) {
+      return reply.code(404).send({ error: "批量下载已失效，请重新选择文件。" });
+    }
+    const files = ticket.ids.map((id) => store.getFile(id));
+    const filesExist = await Promise.all(files.map((file) => file ? store.verifyFile(file) : false));
+    if (filesExist.some((exists) => !exists)) {
+      return reply.code(404).send({ error: "部分所选文件已不存在，请刷新后重试。" });
+    }
+
+    const verifiedFiles = files as FileRecord[];
+    const entryNames = uniqueArchiveNames(verifiedFiles);
+    const archive = new ZipArchive({ forceZip64: true, zlib: { level: 1 }, statConcurrency: 2 });
+    archive.on("warning", (error) => {
+      request.log.warn({ error }, "Unable to include a file in batch download");
+      archive.abort();
+      archive.destroy(error);
+    });
+    archive.on("error", (error) => request.log.warn({ error }, "Batch download stream failed"));
+    request.raw.once("aborted", () => archive.abort());
+    for (const file of verifiedFiles) {
+      archive.file(store.filePath(file), {
+        name: entryNames.get(file.id)!,
+        date: new Date(file.createdAt),
+      });
+    }
+    void archive.finalize().catch((error) => archive.destroy(error));
+    reply
+      .header("Content-Type", "application/zip")
+      .header("Content-Disposition", contentDisposition("Relay-files.zip"))
+      .header("Cache-Control", "private, no-store");
+    return reply.send(archive);
+  });
+
+  app.get<{ Params: { id: string } }>("/api/files/:id/preview", async (request, reply) => {
+    const file = store.getFile(request.params.id);
+    // A thumbnail exists only after the server has decoded and validated this raster image.
+    if (!file || !THUMBNAIL_IMAGE_TYPES.has(file.mime) || !(await store.verifyFile(file))
+      || !(await store.thumbnailSize(file))) {
+      return reply.code(404).send({ error: "这个文件不能安全预览。" });
+    }
+    reply
+      .header("Content-Type", file.mime)
+      .header("Content-Length", String(file.size))
+      .header("Content-Disposition", contentDisposition(file.name, "inline"))
+      .header("Cache-Control", "private, no-store")
+      .header("Content-Security-Policy", "default-src 'none'; sandbox");
+    return reply.send(createReadStream(store.filePath(file)));
+  });
+
   app.get<{ Params: { id: string } }>("/api/files/:id/thumbnail", async (request, reply) => {
     const file = store.getFile(request.params.id);
     if (!file || !(await store.verifyFile(file))) {
@@ -386,7 +541,7 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
       return reply.code(400).send({ error: "请选择 1 到 2000 个要删除的文件。" });
     }
     const ids = [...new Set(requestedIds)];
-    if (ids.some((id) => typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id))) {
+    if (ids.some((id) => typeof id !== "string" || !UUID_PATTERN.test(id))) {
       return reply.code(400).send({ error: "文件列表中包含无效项目。" });
     }
     await thumbnailQueue;

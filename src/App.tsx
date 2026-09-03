@@ -1,5 +1,7 @@
 import {
   Archive,
+  BookOpen,
+  BookmarkPlus,
   Check,
   Clipboard,
   CloudUpload,
@@ -17,7 +19,6 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
-  ShieldCheck,
   Sun,
   Trash2,
   TriangleAlert,
@@ -34,14 +35,17 @@ import {
   useRef,
   useState,
 } from "react";
-import { settleClipboardWrite } from "./clipboard";
+import { clipboardAutosaveDelay, clipboardSyncAction, settleClipboardRead, settleClipboardWrite } from "./clipboard";
+import { api, ApiError } from "./api";
+import { ImageLightbox } from "./ImageLightbox";
+import { Notebook, type NotebookHandle } from "./Notebook";
 
 interface ClipboardState {
   content: string;
   updatedAt: string | null;
 }
 
-interface RelayFile {
+export interface RelayFile {
   id: string;
   name: string;
   size: number;
@@ -71,7 +75,8 @@ interface UploadTask {
   speed?: number;
 }
 
-type UploadOutcome = { ok: true } | { ok: false; message: string; retryable: boolean };
+type UploadOutcome = { ok: true; file: RelayFile } | { ok: false; message: string; retryable: boolean };
+interface StateLoadOptions { force?: boolean; refreshClipboard?: boolean }
 
 interface ToastState {
   id: number;
@@ -116,22 +121,6 @@ function concurrencyForSpeed(bytesPerSecond: number | null): number {
 
 function prefersReducedData(): boolean {
   return (navigator as Navigator & { connection?: NetworkInformation }).connection?.saveData === true;
-}
-
-async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  if (init?.body != null && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
-  const response = await fetch(url, {
-    ...init,
-    headers,
-  });
-  if (!response.ok) {
-    const data = await response.json().catch(() => null) as { error?: string } | null;
-    throw new Error(data?.error || `请求失败（${response.status}）`);
-  }
-  return response.status === 204 ? (undefined as T) : response.json() as Promise<T>;
 }
 
 function formatBytes(bytes: number): string {
@@ -207,11 +196,11 @@ function iconFor(file: RelayFile): ReactNode {
   return <File {...props} />;
 }
 
-function FileVisual({ file }: { file: RelayFile }) {
+function FileVisual({ file, onPreview }: { file: RelayFile; onPreview(file: RelayFile): void }) {
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   if (file.hasThumbnail && !thumbnailFailed) {
     return (
-      <div className="file-icon file-thumbnail">
+      <button className="file-icon file-thumbnail file-thumbnail-button" type="button" onClick={() => onPreview(file)} title={`放大查看 ${file.name}`} aria-label={`放大查看 ${file.name}`}>
         <img
           src={`/api/files/${file.id}/thumbnail`}
           alt=""
@@ -219,7 +208,7 @@ function FileVisual({ file }: { file: RelayFile }) {
           decoding="async"
           onError={() => setThumbnailFailed(true)}
         />
-      </div>
+      </button>
     );
   }
   return <div className="file-icon">{iconFor(file)}</div>;
@@ -233,8 +222,16 @@ export default function App() {
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [lastConnectedAt, setLastConnectedAt] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [composing, setComposing] = useState(false);
+  const [clipboardError, setClipboardError] = useState("");
+  const [clipboardRetryable, setClipboardRetryable] = useState(true);
+  const [notebookOpen, setNotebookOpen] = useState(() => window.location.hash === "#notebook");
+  const notebookRef = useRef<NotebookHandle>(null);
+  const notebookOpenRef = useRef(notebookOpen);
+  const [notesRevision, setNotesRevision] = useState(0);
+  const [addingNote, setAddingNote] = useState(false);
   const [refreshingClipboard, setRefreshingClipboard] = useState(false);
-  const [confirmClipboardRefresh, setConfirmClipboardRefresh] = useState(false);
+  const [refreshingFiles, setRefreshingFiles] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [uploads, setUploads] = useState<UploadTask[]>([]);
   const [query, setQuery] = useState("");
@@ -243,6 +240,8 @@ export default function App() {
   const [renameDraft, setRenameDraft] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [previewImage, setPreviewImage] = useState<RelayFile | null>(null);
+  const [batchDownloading, setBatchDownloading] = useState(false);
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [dark, setDark] = useState(() => {
     const saved = localStorage.getItem("relay-theme");
@@ -253,9 +252,15 @@ export default function App() {
   const renameInput = useRef<HTMLInputElement>(null);
   const dirtyRef = useRef(false);
   const draftRef = useRef("");
+  const clipboardEditRevision = useRef(0);
+  const manualSyncQueued = useRef(false);
+  const composingRef = useRef(false);
+  const addingNoteRef = useRef(false);
+  const noteSnapshot = useRef<{ id: string; content: string } | null>(null);
   const clipboardWritePending = useRef(false);
   const clipboardFocused = useRef(false);
   const clipboardRefreshPending = useRef(false);
+  const filesRefreshPending = useRef(false);
   const stateRequestId = useRef(0);
   const stateRequestAbort = useRef<AbortController | null>(null);
   const toastId = useRef(0);
@@ -267,6 +272,27 @@ export default function App() {
   const cancelled = useRef(new Set<string>());
   // 所有上传（新批次和手动重试）共用一条队列，避免多批并发一起压垮弱网链路。
   const uploadChain = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    let navigation = 0;
+    const navigate = async () => {
+      const request = ++navigation;
+      const nextOpen = window.location.hash === "#notebook";
+      if (!nextOpen && notebookOpenRef.current) {
+        const saved = await notebookRef.current?.saveBeforeLeave();
+        if (request !== navigation) return;
+        if (saved === false) {
+          window.history.replaceState(null, "", "#notebook");
+          return;
+        }
+      }
+      notebookOpenRef.current = nextOpen;
+      setNotebookOpen(nextOpen);
+    };
+    const onHashChange = () => { void navigate(); };
+    window.addEventListener("hashchange", onHashChange);
+    return () => { navigation += 1; window.removeEventListener("hashchange", onHashChange); };
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -294,20 +320,23 @@ export default function App() {
     setLastConnectedAt(new Date().toISOString());
   }, []);
 
-  const invalidateStateRead = useCallback(() => {
+  const invalidateStateRead = useCallback((finishLoading = true) => {
     stateRequestId.current += 1;
     stateRequestAbort.current?.abort();
     stateRequestAbort.current = null;
+    if (finishLoading) setLoading(false);
   }, []);
 
-  const loadState = useCallback(async (forceClipboard = false) => {
-    // 手动刷新期间暂停后台同步，并忽略更早请求的迟到响应。
-    if (clipboardWritePending.current || (clipboardRefreshPending.current && !forceClipboard)) return false;
+  const loadState = useCallback(async ({ force = false, refreshClipboard = false }: StateLoadOptions = {}) => {
+    // Manual refresh takes over an older read. Background polling stays quiet
+    // instead of creating overlapping state requests.
+    if (clipboardWritePending.current && !force) return false;
     if (stateRequestAbort.current) {
-      if (!forceClipboard) return false;
+      if (!force) return false;
       stateRequestAbort.current.abort();
     }
     const requestId = ++stateRequestId.current;
+    const requestedRevision = clipboardEditRevision.current;
     const controller = new AbortController();
     stateRequestAbort.current = controller;
     const timeout = window.setTimeout(() => controller.abort(), 15_000);
@@ -319,17 +348,19 @@ export default function App() {
       if (requestId !== stateRequestId.current) return false;
       setState(next);
       markConnected();
-      if (forceClipboard || (!dirtyRef.current && !clipboardFocused.current)) {
-        setDraft(next.clipboard.content);
-        draftRef.current = next.clipboard.content;
-        dirtyRef.current = false;
-        setDirty(false);
+      if (refreshClipboard || (!dirtyRef.current && !clipboardFocused.current && !composingRef.current)) {
+        const settled = settleClipboardRead(draftRef.current, requestedRevision, clipboardEditRevision.current, next.clipboard.content);
+        setDraft(settled.draft);
+        draftRef.current = settled.draft;
+        dirtyRef.current = settled.dirty;
+        setDirty(settled.dirty);
+        if (!settled.dirty) setClipboardError("");
       }
       return true;
     } catch (error) {
       if (requestId === stateRequestId.current) {
         setConnectionStatus("offline");
-        if (forceClipboard) notify("刷新失败，当前文字已保留，请稍后重试", "error");
+        if (refreshClipboard) notify("刷新失败，当前文字已保留，请稍后重试", "error");
       }
       return false;
     } finally {
@@ -352,33 +383,15 @@ export default function App() {
       window.clearInterval(timer);
       window.removeEventListener("offline", offline);
       window.removeEventListener("online", online);
-      invalidateStateRead();
+      invalidateStateRead(false);
     };
   }, [invalidateStateRead, loadState]);
 
-  const refreshClipboard = async (discardDraft = false) => {
-    if (clipboardWritePending.current || clipboardRefreshPending.current) return;
-    if (dirtyRef.current && !discardDraft) {
-      setConfirmClipboardRefresh(true);
-      return;
-    }
-    setConfirmClipboardRefresh(false);
-    clipboardRefreshPending.current = true;
-    setRefreshingClipboard(true);
-    try {
-      if (await loadState(true)) notify("已获取最新剪贴板");
-    } finally {
-      clipboardRefreshPending.current = false;
-      setRefreshingClipboard(false);
-    }
-  };
-
-  const saveClipboard = useCallback(async () => {
-    if (clipboardRefreshPending.current || clipboardWritePending.current) return;
+  const saveClipboard = useCallback(async (silent = false) => {
+    if (!dirtyRef.current || composingRef.current || clipboardRefreshPending.current || clipboardWritePending.current) return;
     clipboardWritePending.current = true;
     invalidateStateRead();
     const submittedDraft = draftRef.current;
-    setConfirmClipboardRefresh(false);
     setSaving(true);
     try {
       const result = await api<{ clipboard: ClipboardState }>("/api/clipboard", {
@@ -391,15 +404,68 @@ export default function App() {
       setDraft(settled.draft);
       setDirty(settled.dirty);
       setState((current) => ({ ...current, clipboard: result.clipboard }));
+      setClipboardError("");
       markConnected();
-      notify(settled.dirty ? "已保存，新增文字尚未同步" : "剪贴板已同步到所有设备");
+      if (!silent) notify(settled.dirty ? "已保存，新增文字尚未同步" : "剪贴板已同步到所有设备");
     } catch (error) {
-      notify((error as Error).message, "error");
+      setClipboardError((error as Error).message);
+      setClipboardRetryable(!(error instanceof ApiError) || error.status >= 500 || [408, 429].includes(error.status));
+      if (!silent) notify((error as Error).message, "error");
     } finally {
       clipboardWritePending.current = false;
       setSaving(false);
+      void loadState({ force: true });
     }
-  }, [invalidateStateRead, markConnected, notify]);
+  }, [invalidateStateRead, loadState, markConnected, notify]);
+
+  const syncClipboard = useCallback(async () => {
+    const action = clipboardSyncAction(dirtyRef.current, clipboardWritePending.current || clipboardRefreshPending.current, composingRef.current);
+    // An explicit click during autosave is remembered, without dimming controls.
+    manualSyncQueued.current = action === "wait";
+    if (action === "wait") return;
+    if (action === "save") return saveClipboard();
+    clipboardRefreshPending.current = true;
+    setRefreshingClipboard(true);
+    try {
+      if (await loadState({ force: true, refreshClipboard: true })) notify(dirtyRef.current ? "已刷新，正在编辑的文字已保留" : "已与云端同步");
+    } finally {
+      clipboardRefreshPending.current = false;
+      setRefreshingClipboard(false);
+    }
+  }, [loadState, notify, saveClipboard]);
+
+  useEffect(() => {
+    if (manualSyncQueued.current && !saving && !refreshingClipboard && !composing) void syncClipboard();
+  }, [saving, refreshingClipboard, composing, syncClipboard]);
+
+  useEffect(() => {
+    const delay = clipboardAutosaveDelay({ dirty, saving, composing, refreshing: refreshingClipboard, failed: Boolean(clipboardError), retryable: clipboardRetryable });
+    if (delay === null) return;
+    const timer = window.setTimeout(() => void saveClipboard(true), delay);
+    return () => window.clearTimeout(timer);
+  }, [draft, dirty, saving, composing, refreshingClipboard, clipboardError, clipboardRetryable, saveClipboard]);
+
+  useEffect(() => {
+    const flush = () => { if (document.visibilityState === "hidden") void saveClipboard(true); };
+    document.addEventListener("visibilitychange", flush);
+    return () => document.removeEventListener("visibilitychange", flush);
+  }, [saveClipboard]);
+
+  const saveToNotebook = async () => {
+    const content = draftRef.current;
+    if (!content.trim() || addingNoteRef.current) return;
+    addingNoteRef.current = true;
+    setAddingNote(true);
+    if (noteSnapshot.current?.content !== content) noteSnapshot.current = { id: crypto.randomUUID(), content };
+    try {
+      await api("/api/notes", { method: "POST", body: JSON.stringify(noteSnapshot.current) });
+      noteSnapshot.current = null;
+      setNotesRevision((value) => value + 1);
+      void loadState({ force: true });
+      notify("已存入记事本");
+    } catch (error) { notify((error as Error).message, "error"); }
+    finally { addingNoteRef.current = false; setAddingNote(false); }
+  };
 
   const copyClipboard = async () => {
     if (!draft) return notify("剪贴板还是空的", "error");
@@ -417,7 +483,6 @@ export default function App() {
     clipboardWritePending.current = true;
     invalidateStateRead();
     const submittedDraft = draftRef.current;
-    setConfirmClipboardRefresh(false);
     setSaving(true);
     try {
       const result = await api<{ clipboard: ClipboardState }>("/api/clipboard", { method: "DELETE" });
@@ -429,11 +494,26 @@ export default function App() {
       setState((current) => ({ ...current, clipboard: result.clipboard }));
       markConnected();
       notify(settled.dirty ? "云端已清空，新增文字已保留" : "共享剪贴板已清空");
+      setClipboardError("");
     } catch (error) {
       notify((error as Error).message, "error");
     } finally {
       clipboardWritePending.current = false;
       setSaving(false);
+      void loadState({ force: true });
+    }
+  };
+
+  const refreshFiles = async () => {
+    if (filesRefreshPending.current) return;
+    filesRefreshPending.current = true;
+    setRefreshingFiles(true);
+    try {
+      const refreshed = await loadState({ force: true });
+      notify(refreshed ? "文件列表已刷新" : "刷新失败，请稍后重试", refreshed ? "success" : "error");
+    } finally {
+      filesRefreshPending.current = false;
+      setRefreshingFiles(false);
     }
   };
 
@@ -498,8 +578,15 @@ export default function App() {
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        noteLinkSpeed(file.size, Date.now() - startedAt);
-        settle({ ok: true });
+        try {
+          const result = JSON.parse(xhr.responseText) as { file?: RelayFile };
+          if (result.file?.id) {
+            noteLinkSpeed(file.size, Date.now() - startedAt);
+            settle({ ok: true, file: result.file });
+            return;
+          }
+        } catch { /* handled below */ }
+        settle({ ok: false, message: "服务器没有返回文件信息", retryable: true });
         return;
       }
       let message = `上传失败（${xhr.status}）`;
@@ -522,19 +609,19 @@ export default function App() {
     xhr.send(body);
   });
 
-  const uploadOne = async (file: globalThis.File, taskId: string): Promise<boolean> => {
+  const uploadOne = async (file: globalThis.File, taskId: string): Promise<RelayFile | null> => {
     for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt += 1) {
       if (cancelled.current.has(taskId)) break;
       updateUpload(taskId, { status: "uploading", progress: 0, error: undefined, retryable: undefined, speed: undefined });
       const outcome = await sendOnce(file, taskId);
       if (outcome.ok) {
         updateUpload(taskId, { progress: 100, status: "done", error: undefined, speed: undefined });
-        return true;
+        return outcome.file;
       }
       if (cancelled.current.has(taskId)) break;
       if (!outcome.retryable || attempt === UPLOAD_MAX_ATTEMPTS) {
         updateUpload(taskId, { status: "error", error: outcome.message, retryable: outcome.retryable, speed: undefined });
-        return false;
+        return null;
       }
       // 退避期间把原因留在行里，用户能看到「为什么在等」。下一轮开头会清掉。
       updateUpload(taskId, { error: `${outcome.message}，重试中（${attempt + 1}/${UPLOAD_MAX_ATTEMPTS}）`, speed: undefined });
@@ -542,7 +629,7 @@ export default function App() {
     }
     // 取消过的任务留一个可以手动重来的入口。
     updateUpload(taskId, { status: "error", error: "已取消", retryable: true, speed: undefined });
-    return false;
+    return null;
   };
 
   const cancelUpload = (taskId: string) => {
@@ -551,11 +638,11 @@ export default function App() {
   };
 
   // 自适应并发队列：网快就多开几路，一旦出现网络类失败立刻退回串行。
-  const runUploadQueue = (items: Array<{ file: globalThis.File; taskId: string }>): Promise<number> =>
+  const runUploadQueue = (items: Array<{ file: globalThis.File; taskId: string }>): Promise<RelayFile[]> =>
     new Promise((resolve) => {
       let cursor = 0;
       let active = 0;
-      let succeeded = 0;
+      const uploaded: RelayFile[] = [];
       let degraded = false;
       // 每批都先用一个文件探路。上一批测到的速度不能证明这一刻链路还活着，
       // 而一旦链路是死的，探路只赔上 1 个文件，而不是一次赔上一整批。
@@ -564,17 +651,17 @@ export default function App() {
 
       const pump = () => {
         if (cursor >= items.length && active === 0) {
-          resolve(succeeded);
+          resolve(uploaded);
           return;
         }
         while (active < target && cursor < items.length) {
           const item = items[cursor];
           cursor += 1;
           active += 1;
-          void uploadOne(item.file, item.taskId).then((ok) => {
+          void uploadOne(item.file, item.taskId).then((file) => {
             active -= 1;
-            if (ok) {
-              succeeded += 1;
+            if (file) {
+              uploaded.push(file);
               // 一路顺利就按最新实测速度重新定档，网好的时候能迅速开到上限。
               if (!degraded && !prefersReducedData()) {
                 target = Math.max(target, Math.min(concurrencyForSpeed(freshLinkSpeed()), items.length));
@@ -591,13 +678,13 @@ export default function App() {
         }
       };
 
-      if (!items.length) resolve(0);
+      if (!items.length) resolve([]);
       else pump();
     });
 
-  const addFiles = async (incoming: FileList | globalThis.File[]) => {
+  const addFiles = async (incoming: FileList | globalThis.File[]): Promise<RelayFile[]> => {
     const files = Array.from(incoming);
-    if (!files.length) return;
+    if (!files.length) return [];
     let available = Math.max(0, state.storage.maxBytes - state.storage.usedBytes);
     const accepted = files.filter((file) => {
       if (file.size > state.limits.maxUploadBytes) {
@@ -611,7 +698,7 @@ export default function App() {
       available -= file.size;
       return true;
     });
-    if (!accepted.length) return;
+    if (!accepted.length) return [];
     const tasks = accepted.map((file) => ({
       id: crypto.randomUUID(),
       name: file.name,
@@ -623,15 +710,18 @@ export default function App() {
 
     // 批次之间也要排队。否则连着拖两次文件，就变成两条队列各自并发，
     // 弱网下又回到「一起发、一起失败」的老问题。
-    uploadChain.current = uploadChain.current.then(async () => {
-      const succeeded = await runUploadQueue(accepted.map((file, index) => ({ file, taskId: tasks[index].id })));
-      await loadState();
-      const failed = accepted.length - succeeded;
-      if (!failed) notify(`${succeeded} 个文件已放入中转区`);
-      else if (!succeeded) notify(`${failed} 个文件上传失败，可以点重试`, "error");
-      else notify(`${succeeded} 个已上传，${failed} 个失败，可以点重试`, "error");
+    const batch = uploadChain.current.then(async () => {
+      const uploaded = await runUploadQueue(accepted.map((file, index) => ({ file, taskId: tasks[index].id })));
+      await loadState({ force: true });
+      const failed = accepted.length - uploaded.length;
+      if (!failed) notify(`${uploaded.length} 个文件已放入中转区`);
+      else if (!uploaded.length) notify(`${failed} 个文件上传失败，可以点重试`, "error");
+      else notify(`${uploaded.length} 个已上传，${failed} 个失败，可以点重试`, "error");
       window.setTimeout(() => setUploads((current) => current.filter((task) => task.status !== "done")), 2200);
+      return uploaded;
     });
+    uploadChain.current = batch.then(() => undefined, () => undefined);
+    return batch;
   };
 
   const retryUpload = (taskId: string) => {
@@ -640,10 +730,10 @@ export default function App() {
     updateUpload(taskId, { status: "uploading", progress: 0, error: undefined });
     uploadChain.current = uploadChain.current.then(async () => {
       cancelled.current.delete(taskId);
-      const ok = await uploadOne(task.file, taskId);
-      await loadState();
-      notify(ok ? `${task.name} 已放入中转区` : `${task.name} 仍然失败`, ok ? "success" : "error");
-      if (ok) window.setTimeout(() => setUploads((current) => current.filter((item) => item.status !== "done")), 2200);
+      const file = await uploadOne(task.file, taskId);
+      await loadState({ force: true });
+      notify(file ? `${task.name} 已放入中转区` : `${task.name} 仍然失败`, file ? "success" : "error");
+      if (file) window.setTimeout(() => setUploads((current) => current.filter((item) => item.status !== "done")), 2200);
     });
   };
 
@@ -687,7 +777,7 @@ export default function App() {
         next.delete(file.id);
         return next;
       });
-      await loadState();
+      await loadState({ force: true });
       notify("文件已删除");
     } catch (error) {
       notify((error as Error).message, "error");
@@ -747,6 +837,10 @@ export default function App() {
     });
   }, [state.files]);
 
+  useEffect(() => {
+    if (previewImage && !state.files.some((file) => file.id === previewImage.id)) setPreviewImage(null);
+  }, [previewImage, state.files]);
+
   const allVisibleSelected = visibleFiles.length > 0
     && visibleFiles.every((file) => selectedIds.has(file.id));
 
@@ -798,6 +892,40 @@ export default function App() {
     }
   };
 
+  const startBrowserDownload = (url: string) => {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "";
+    document.body.append(link);
+    link.click();
+    link.remove();
+  };
+
+  const downloadSelected = async () => {
+    const ids = state.files.filter((file) => selectedIds.has(file.id)).map((file) => file.id);
+    if (!ids.length) return;
+    if (ids.length === 1) {
+      startBrowserDownload(`/api/files/${ids[0]}/download`);
+      return;
+    }
+    setBatchDownloading(true);
+    try {
+      const result = await api<{ url: string }>("/api/files/archive", {
+        method: "POST",
+        body: JSON.stringify({ ids }),
+      });
+      startBrowserDownload(result.url);
+      notify(`正在下载 ${ids.length} 个文件`);
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBatchDownloading(false);
+    }
+  };
+
+  const syncStatus = clipboardError ? "error" : dirty || saving || refreshingClipboard ? "pending" : connectionStatus === "online" ? "saved" : "offline";
+  const syncDescription = clipboardError ? `同步失败：${clipboardError}` : saving || refreshingClipboard ? "正在同步，仍可继续输入" : dirty ? "有改动，点击保存或等待自动同步" : connectionStatus === "online" ? "已保存；点击获取云端最新内容" : "尚未连接；点击重试";
+
   return (
     <main className="shell">
       <div className="ambient ambient-one" />
@@ -813,85 +941,77 @@ export default function App() {
         </div>
         <div className="topbar-actions">
           <div className={`connection is-${connectionStatus}`} role="status" title={lastConnectedAt ? `最近连接成功：${relativeTime(lastConnectedAt)}` : "尚未连接成功"}>
-            <span />{connectionStatus === "online" ? "已连接共享空间" : connectionStatus === "connecting" ? "正在连接" : "连接中断，正在重试"}
+            <span />{connectionStatus === "online" ? "已连接" : connectionStatus === "connecting" ? "连接中" : "连接中断"}
           </div>
           <button className="icon-button" onClick={() => setDark((value) => !value)} aria-label="切换明暗主题">
             {dark ? <Sun size={18} /> : <Moon size={18} />}
           </button>
+          <a className={`button secondary notebook-link ${notebookOpen ? "is-active" : ""}`} href={notebookOpen ? "#" : "#notebook"} aria-label={notebookOpen ? "返回中转首页" : "打开记事本"}><BookOpen size={16} /><span>记事本</span></a>
         </div>
       </header>
 
+      <Notebook ref={notebookRef} open={notebookOpen} revision={notesRevision} files={state.files} onBack={() => { window.location.hash = ""; }} onStorageChange={() => { void loadState({ force: true }); }} onUploadImages={addFiles} notify={notify} />
+
+      <div hidden={notebookOpen}>
       <section className="card clipboard-card">
         <div className="card-heading">
           <div className="heading-copy">
             <div className="section-icon violet"><Clipboard size={19} /></div>
             <div>
               <h2>共享剪贴板</h2>
-              <p>{dirty ? "有改动尚未保存" : `上次同步：${relativeTime(state.clipboard.updatedAt)}`}</p>
             </div>
           </div>
           <div className="clipboard-actions">
-            <div className={`save-state ${dirty || connectionStatus === "offline" ? "is-dirty" : ""}`}>
-              <span />{refreshingClipboard ? "刷新中" : saving ? "保存中" : dirty ? "待同步" : connectionStatus === "offline" ? "未连接" : connectionStatus === "connecting" ? "连接中" : "已同步"}
-            </div>
             <button
-              className="icon-button"
-              onClick={() => void refreshClipboard()}
-              disabled={saving || refreshingClipboard}
-              aria-label="刷新剪贴板"
-              aria-busy={refreshingClipboard}
-              title="获取最新剪贴板"
+              className="button secondary clipboard-sync"
+              onClick={() => void syncClipboard()}
+              aria-label="保存或刷新剪贴板"
+              title={syncDescription}
             >
-              <RefreshCw className={refreshingClipboard ? "spin" : undefined} size={17} />
+              <span className={`sync-dot is-${syncStatus}`} role="img" aria-label={syncDescription} />
+              保存 / 刷新
             </button>
           </div>
         </div>
 
-        {confirmClipboardRefresh && (
-          <div className="clipboard-refresh-confirm" role="alert">
-            <p>有未保存的文字，刷新会用云端内容替换。</p>
-            <div className="refresh-confirm-buttons">
-              <button className="button secondary" onClick={() => setConfirmClipboardRefresh(false)}>取消</button>
-              <button className="button secondary" onClick={() => void refreshClipboard(true)}>放弃修改并刷新</button>
-            </div>
-          </div>
-        )}
-
         <textarea
           value={draft}
-          readOnly={refreshingClipboard}
           onChange={(event) => {
+            clipboardEditRevision.current += 1;
             setDraft(event.target.value);
+            setClipboardError("");
             draftRef.current = event.target.value;
             dirtyRef.current = event.target.value !== state.clipboard.content;
             setDirty(dirtyRef.current);
           }}
           onPaste={onClipboardPaste}
+          onCompositionStart={() => { clipboardEditRevision.current += 1; composingRef.current = true; setComposing(true); }}
+          onCompositionEnd={() => { composingRef.current = false; setComposing(false); }}
           onFocus={() => { clipboardFocused.current = true; }}
           onBlur={() => { clipboardFocused.current = false; }}
           onKeyDown={(event) => {
-            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+            if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !event.nativeEvent.isComposing) {
               event.preventDefault();
-              if (dirty && !saving && !refreshingClipboard) void saveClipboard();
+              void syncClipboard();
             }
           }}
-          placeholder={"粘贴命令、网址、地址或一段临时文字…\n也可以直接粘贴截图或图片，自动放入下方文件区\n\n⌘ / Ctrl + Enter 快速保存"}
+          placeholder="写点什么…"
           aria-label="共享剪贴板内容"
           spellCheck={false}
         />
 
         <div className="clipboard-footer">
-          <span>{draft.length.toLocaleString("zh-CN")} 个字符 · 支持直接粘贴截图</span>
+          <span>{draft.length.toLocaleString("zh-CN")} 字符</span>
           <div className="button-row">
-            <button className="button ghost danger-ghost" onClick={() => void clearClipboard()} disabled={saving || refreshingClipboard || (!draft && !state.clipboard.content)}>
+            <button className="button ghost danger-ghost" onClick={() => void clearClipboard()} aria-disabled={saving || refreshingClipboard} disabled={!draft && !state.clipboard.content}>
               <Trash2 size={16} /> 清空
             </button>
             <button className="button secondary" onClick={() => void copyClipboard()} disabled={!draft}>
               <Copy size={16} /> 复制
             </button>
-            <button className="button primary" onClick={() => void saveClipboard()} disabled={!dirty || saving || refreshingClipboard}>
-              {saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
-              {saving ? "保存中" : "保存并同步"}
+            <button className="button primary" onClick={() => void saveToNotebook()} disabled={!draft.trim() || addingNote}>
+              {addingNote ? <LoaderCircle className="spin" size={16} /> : <BookmarkPlus size={16} />}
+              {addingNote ? "存入中" : "存到记事本"}
             </button>
           </div>
         </div>
@@ -903,7 +1023,6 @@ export default function App() {
             <div className="section-icon blue"><Archive size={19} /></div>
             <div>
               <h2>文件中转区</h2>
-              <p>{state.files.length ? `共享空间里有 ${state.files.length} 个文件` : "上传后，其他设备刷新即可看见"}</p>
             </div>
           </div>
           <div className="storage-group">
@@ -911,8 +1030,8 @@ export default function App() {
               <span>{formatBytes(state.storage.usedBytes)} / {formatBytes(state.storage.maxBytes)}</span>
               <div className="storage-track"><span style={{ width: `${Math.min(100, state.storage.usedBytes / state.storage.maxBytes * 100)}%` }} /></div>
             </div>
-            <button className="icon-button" onClick={() => void loadState()} aria-label="刷新文件列表" title="刷新">
-              <RefreshCw size={17} />
+            <button className="icon-button" onClick={() => void refreshFiles()} disabled={refreshingFiles} aria-label="刷新文件列表" title="刷新">
+              <RefreshCw size={17} className={refreshingFiles ? "spin" : undefined} />
             </button>
           </div>
         </div>
@@ -1002,7 +1121,13 @@ export default function App() {
                 <span>{query ? "全选结果" : "全选"}</span>
               </label>
               {selectedIds.size > 0 && (
-                <button className="batch-delete" onClick={() => void deleteSelected()} disabled={batchDeleting}>
+                <button className="batch-download" onClick={() => void downloadSelected()} disabled={batchDownloading || batchDeleting}>
+                  {batchDownloading ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}
+                  下载 {selectedIds.size} 项
+                </button>
+              )}
+              {selectedIds.size > 0 && (
+                <button className="batch-delete" onClick={() => void deleteSelected()} disabled={batchDeleting || batchDownloading}>
                   {batchDeleting ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}
                   删除 {selectedIds.size} 项
                 </button>
@@ -1018,12 +1143,11 @@ export default function App() {
 
         <div className="file-list">
           {loading ? (
-            <div className="empty-state"><LoaderCircle className="spin" size={22} /><strong>正在连接共享空间</strong></div>
+            <div className="empty-state"><LoaderCircle className="spin" size={22} /><strong>正在读取</strong></div>
           ) : visibleFiles.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon"><File size={23} /></div>
               <strong>{query ? "没有匹配的文件" : "这里还没有文件"}</strong>
-              <span>{query ? "换一个关键词试试" : "从任意设备上传，都会出现在这里"}</span>
             </div>
           ) : visibleFiles.map((file) => (
             <article className={`file-row ${selectedIds.has(file.id) ? "is-selected" : ""}`} key={file.id}>
@@ -1035,7 +1159,7 @@ export default function App() {
                   aria-label={`选择 ${file.name}`}
                 />
               </label>
-              <FileVisual file={file} />
+              <FileVisual file={file} onPreview={setPreviewImage} />
               <div className="file-info">
                 {editingId === file.id ? (
                   <input
@@ -1085,11 +1209,8 @@ export default function App() {
         </div>
       </section>
 
-      <footer>
-        <span><ShieldCheck size={14} /> HTTPS 与登录保护由部署入口提供</span>
-        <span>文件永久保存，按需手动删除</span>
-      </footer>
-
+      </div>
+      {previewImage && !notebookOpen && <ImageLightbox key={previewImage.id} image={previewImage} onClose={() => setPreviewImage(null)} />}
       {toast && (
         <div className={`toast ${toast.kind}`} role="status">
           {toast.kind === "success" ? <Check size={16} /> : <X size={16} />}

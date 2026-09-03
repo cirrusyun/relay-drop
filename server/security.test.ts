@@ -77,9 +77,15 @@ test("all supported raster image signatures still produce small thumbnails", asy
       const result = await app.inject(upload(bytes, `fixture.${format}`, `image/${format}`));
       assert.equal(result.statusCode, 201, format);
       assert.equal(result.json().file.hasThumbnail, true, format);
-      const thumbnail = await app.inject(`/api/files/${result.json().file.id}/thumbnail`);
+      const id = result.json().file.id;
+      const thumbnail = await app.inject(`/api/files/${id}/thumbnail`);
       assert.equal(thumbnail.statusCode, 200);
       assert.ok(thumbnail.rawPayload.length < 10_000);
+      const preview = await app.inject(`/api/files/${id}/preview`);
+      assert.equal(preview.statusCode, 200);
+      assert.equal(preview.headers["content-type"], `image/${format}`);
+      assert.match(String(preview.headers["content-disposition"]), /^inline;/);
+      assert.deepEqual(preview.rawPayload, bytes);
     }
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
@@ -105,15 +111,19 @@ test("malformed paths, invalid deletions and cross-site mutations cannot alter s
   try {
     const added = await app.inject(upload("kept"));
     const id = added.json().file.id;
-    for (const url of ["/api/files/..%2Fstate.json/download", "/api/files/%2Fetc%2Fpasswd/download", "/api/files/not-an-id/thumbnail"]) {
+    for (const url of ["/api/files/..%2Fstate.json/download", "/api/files/%2Fetc%2Fpasswd/download", "/api/files/not-an-id/thumbnail", "/api/files/not-an-id/preview"]) {
       assert.equal((await app.inject(url)).statusCode, 404);
     }
-    for (const ids of [["../state.json"], [null], "not-an-array", [], [id, { id }]]) {
+    for (const ids of [["../state.json"], ["------------------------------------"], [null], "not-an-array", [], [id, { id }]]) {
       assert.equal((await app.inject({ method: "DELETE", url: "/api/files", payload: { ids } })).statusCode, 400);
+    }
+    for (const ids of [[id], [id, id], [id, "../state.json"], "not-an-array"]) {
+      assert.equal((await app.inject({ method: "POST", url: "/api/files/archive", payload: { ids } })).statusCode, 400);
     }
     for (const [method, url, payload] of [
       ["DELETE", `/api/files/${id}`, undefined],
       ["DELETE", "/api/files", { ids: [id] }],
+      ["POST", "/api/files/archive", { ids: [id, randomUUID()] }],
       ["PATCH", `/api/files/${id}`, { name: "changed" }],
       ["DELETE", "/api/clipboard", undefined],
     ] as const) {
