@@ -200,7 +200,7 @@ select:focus-visible,
 .heading-copy p { margin: 0; color: var(--ink-faint); font-size: 12px; }
 
 .clipboard-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.clipboard-sync { white-space: nowrap; }
+.clipboard-sync, .clipboard-note-save { white-space: nowrap; }
 .sync-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--ink-faint); }
 .sync-dot.is-saved { background: var(--green); }
 .sync-dot.is-pending { background: var(--amber); }

@@ -109,6 +109,15 @@ async function openNote(title: string) {
 const footer = () => dom.document.querySelector(".note-editor-footer")?.textContent;
 const editorVisible = () => !dom.document.querySelector(".notebook")?.hasAttribute("hidden");
 
+test("clipboard save is kept in the footer while save-to-notebook stays in the heading", async (t) => {
+  const { container } = await setup(t, undefined, false);
+  await flush();
+  const save = container.querySelector('[aria-label="保存或刷新剪贴板"]');
+  const saveToNotebook = container.querySelector(".clipboard-note-save");
+  assert.ok(save?.closest(".clipboard-footer"));
+  assert.ok(saveToNotebook?.closest(".card-heading"));
+});
+
 test("slow note switches preserve newly typed text and a later click saves it before switching", async (t) => {
   const { notes, control } = await setup(t);
   await openNote("Test A");

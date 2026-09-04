@@ -963,13 +963,12 @@ export default function App() {
           </div>
           <div className="clipboard-actions">
             <button
-              className="button secondary clipboard-sync"
-              onClick={() => void syncClipboard()}
-              aria-label="保存或刷新剪贴板"
-              title={syncDescription}
+              className="button secondary clipboard-note-save"
+              onClick={() => void saveToNotebook()}
+              disabled={!draft.trim() || addingNote}
             >
-              <span className={`sync-dot is-${syncStatus}`} role="img" aria-label={syncDescription} />
-              保存 / 刷新
+              {addingNote ? <LoaderCircle className="spin" size={16} /> : <BookmarkPlus size={16} />}
+              {addingNote ? "存入中" : "存到记事本"}
             </button>
           </div>
         </div>
@@ -1009,9 +1008,14 @@ export default function App() {
             <button className="button secondary" onClick={() => void copyClipboard()} disabled={!draft}>
               <Copy size={16} /> 复制
             </button>
-            <button className="button primary" onClick={() => void saveToNotebook()} disabled={!draft.trim() || addingNote}>
-              {addingNote ? <LoaderCircle className="spin" size={16} /> : <BookmarkPlus size={16} />}
-              {addingNote ? "存入中" : "存到记事本"}
+            <button
+              className="button primary clipboard-sync"
+              onClick={() => void syncClipboard()}
+              aria-label="保存或刷新剪贴板"
+              title={syncDescription}
+            >
+              <span className={`sync-dot is-${syncStatus}`} role="img" aria-label={syncDescription} />
+              保存 / 刷新
             </button>
           </div>
         </div>
