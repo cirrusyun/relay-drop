@@ -27,13 +27,13 @@ function deferred() {
 
 async function flush() { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); }); }
 
-async function setup(t: TestContext, configure?: (fixture: { notes: Map<string, Note>; control: { before(method: string, url: string, signal?: AbortSignal | null): Promise<void>; failSave: boolean; loseCreateResponse: boolean; files: Array<Record<string, unknown>> } }) => void, notebook = true) {
+async function setup(t: TestContext, configure?: (fixture: { notes: Map<string, Note>; control: { before(method: string, url: string, signal?: AbortSignal | null): Promise<void>; failSave: boolean; loseCreateResponse: boolean; files: Array<Record<string, unknown>>; ocrText: string; ocrStatus: number } }) => void, notebook = true) {
   dom.happyDOM.setURL(`https://relay.example/${notebook ? "#notebook" : ""}`);
   const notes = new Map<string, Note>(["a", "b"].map((id) => [id, {
     id, title: `Test ${id.toUpperCase()}`, content: `Original ${id.toUpperCase()}`, attachments: [], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
   }]));
   const requests: Array<{ method: string; url: string; body: Record<string, any> }> = [];
-  const control = { before: async (_method: string, _url: string, _signal?: AbortSignal | null) => {}, failSave: false, loseCreateResponse: false, files: [] as Array<Record<string, unknown>> };
+  const control = { before: async (_method: string, _url: string, _signal?: AbortSignal | null) => {}, failSave: false, loseCreateResponse: false, files: [] as Array<Record<string, unknown>>, ocrText: "", ocrStatus: 200 };
   configure?.({ notes, control });
   let clipboard = { content: "", updatedAt: null as string | null };
   const originalFetch = globalThis.fetch;
@@ -49,6 +49,9 @@ async function setup(t: TestContext, configure?: (fixture: { notes: Map<string, 
       return response({ clipboard });
     }
     if (url === "/api/files/archive" && method === "POST") return response({ url: "/api/files/archive/test-ticket" }, 201);
+    if (/^\/api\/files\/[^/]+\/ocr$/.test(url) && method === "POST") return control.ocrStatus === 200
+      ? response({ text: control.ocrText })
+      : response({ error: "Test OCR failed" }, control.ocrStatus);
     if (url === "/api/notes" && method === "GET") return response({ notes: [...notes.values()].map(({ content, attachments, ...note }) => ({ ...note, preview: content, characters: content.length, attachmentCount: attachments.length })) });
     if (url.startsWith("/api/notes")) {
       const id = method === "POST" ? body.id : url.split("/").pop()!;
@@ -353,36 +356,61 @@ test("selected files can be downloaded individually or together as a streamed ar
   assert.deepEqual(new Set(request?.body.ids), new Set(files.map((file) => file.id)));
 });
 
-test("saved note images render as server thumbnails and unlink without deleting the shared file", async (t) => {
+test("saved note images expand inline from the original and unlink without deleting the shared file", async (t) => {
   const image = { id: "image-a", name: "fixture.png", size: 10, mime: "image/png", createdAt: "2026-01-01T00:00:00Z", hasThumbnail: true };
   const { notes, control } = await setup(t, ({ notes, control }) => {
     notes.set("a", { ...notes.get("a")!, attachments: [image.id] });
     control.files = [image];
   });
   await openNote("Test A");
-  assert.equal(dom.document.querySelector<HTMLImageElement>('.note-attachment img')?.getAttribute("src"), `/api/files/${image.id}/thumbnail`);
-  assert.equal(dom.document.querySelector('.note-attachment span')?.textContent, image.name);
+  assert.equal(dom.document.querySelector<HTMLImageElement>('.note-attachment-image')?.getAttribute("src"), `/api/files/${image.id}/preview`);
+  assert.equal(dom.document.querySelector('.note-attachment-toolbar > span')?.textContent, image.name);
   assert.equal(dom.document.querySelector('.note-attachment a'), null);
-  await click('.note-attachment-preview');
-  assert.equal(dom.document.querySelector('.image-lightbox')?.getAttribute("role"), "dialog");
-  const preview = dom.document.querySelector<HTMLImageElement>('.image-lightbox img');
-  assert.equal(preview?.getAttribute("src"), `/api/files/${image.id}/preview?attempt=0`);
-  await act(async () => { preview?.dispatchEvent(new dom.Event("load")); });
-  await click('[aria-label="查看原始尺寸"]');
-  assert.ok(dom.document.querySelector('.image-lightbox')?.classList.contains("is-zoomed"));
-  await click('[aria-label="适应窗口"]');
-  assert.ok(!dom.document.querySelector('.image-lightbox')?.classList.contains("is-zoomed"));
-  await click('[aria-label="关闭原图预览"]');
+  assert.equal(dom.document.querySelector('.note-attachment-preview'), null);
   assert.equal(dom.document.querySelector('.image-lightbox'), null);
+  control.ocrText = "Manual OCR result";
+  await click(`[aria-label="识别 ${image.name} 中的文字"]`);
+  assert.equal(notes.get("a")?.content, "Original A\n\nManual OCR result");
   await click('.note-attachment-remove');
   await click('.note-editor-actions .primary');
   assert.deepEqual(notes.get("a")?.attachments, []);
   assert.equal(control.files.length, 1);
 });
 
+test("OCR preserves text typed while recognition is pending and blocks note switches", async (t) => {
+  const image = { id: "image-slow", name: "slow.png", size: 10, mime: "image/png", createdAt: "2026-01-01T00:00:00Z", hasThumbnail: true };
+  const gate = deferred();
+  const { notes, control } = await setup(t, ({ notes, control }) => {
+    notes.set("a", { ...notes.get("a")!, attachments: [image.id] });
+    control.files = [image];
+    control.ocrText = "Delayed OCR";
+  });
+  await openNote("Test A");
+  control.before = async (method, url) => { if (method === "POST" && url.endsWith("/ocr")) await gate.promise; };
+  await click(`[aria-label="识别 ${image.name} 中的文字"]`);
+  assert.equal([...dom.document.querySelectorAll<HTMLButtonElement>(".note-item")].every((item) => item.disabled), true);
+  await type("笔记内容", "Typed while OCR runs");
+  gate.resolve();
+  await flush();
+  await flush();
+  assert.equal(notes.get("a")?.content, "Typed while OCR runs\n\nDelayed OCR");
+});
+
+test("PDF export prints only the current note representation", async (t) => {
+  let printCalls = 0;
+  const originalPrint = dom.print;
+  Object.defineProperty(dom, "print", { configurable: true, value: () => { printCalls += 1; } });
+  t.after(() => { Object.defineProperty(dom, "print", { configurable: true, value: originalPrint }); });
+  await setup(t);
+  await openNote("Test A");
+  assert.equal(dom.document.querySelector(".note-print-content")?.textContent, "Original A");
+  await click('[aria-label="导出当前笔记为 PDF"]');
+  assert.equal(printCalls, 1);
+});
+
 test("pasting a screenshot uploads once and immediately persists its note attachment", async (t) => {
   const image = { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", name: "pasted.png", size: 10, mime: "image/png", createdAt: "2026-01-01T00:00:00Z", hasThumbnail: true };
-  const { notes, control } = await setup(t);
+  const { notes, control, requests } = await setup(t, ({ control }) => { control.ocrText = "识别出来的图片文字"; });
   const originalXHR = globalThis.XMLHttpRequest;
   class FakeXHR {
     upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
@@ -405,9 +433,11 @@ test("pasting a screenshot uploads once and immediately persists its note attach
   await act(async () => { field("笔记内容").dispatchEvent(event as unknown as Event); });
   await flush();
   await flush();
-  assert.equal(dom.document.querySelector<HTMLImageElement>('.note-attachment img')?.getAttribute("src"), `/api/files/${image.id}/thumbnail`);
+  assert.equal(dom.document.querySelector<HTMLImageElement>('.note-attachment-image')?.getAttribute("src"), `/api/files/${image.id}/preview`);
   assert.deepEqual(notes.get("a")?.attachments, [image.id]);
-  assert.match(dom.document.body.textContent ?? "", /图片已添加并保存/);
+  assert.equal(notes.get("a")?.content, "Original A\n\n识别出来的图片文字");
+  assert.equal(requests.filter((request) => request.url === `/api/files/${image.id}/ocr`).length, 1);
+  assert.match(dom.document.body.textContent ?? "", /已自动识别 1 张图片的文字/);
   assert.match(footer()!, /已保存/);
   assert.equal(control.files.length, 1);
 });

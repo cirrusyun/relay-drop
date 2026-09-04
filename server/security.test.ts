@@ -90,6 +90,43 @@ test("all supported raster image signatures still produce small thumbnails", asy
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
+test("OCR accepts only validated raster files, stays private, and allows one job at a time", async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "relay-ocr-security-"));
+  let releaseOcr!: () => void;
+  const ocrGate = new Promise<void>((resolve) => { releaseOcr = resolve; });
+  const seenPaths: string[] = [];
+  const app = await buildApp({
+    dataDir,
+    serveFrontend: false,
+    ...disk,
+    ocrRunner: async (filePath) => {
+      seenPaths.push(filePath);
+      await ocrGate;
+      return "测试 OCR text";
+    },
+  });
+  try {
+    const bytes = await sharp({ create: { width: 12, height: 12, channels: 3, background: "white" } }).png().toBuffer();
+    const image = await app.inject(upload(bytes, "notes.png", "image/png"));
+    const imageId = image.json().file.id;
+    const textFile = await app.inject(upload("plain", "plain.txt", "text/plain"));
+    const textId = textFile.json().file.id;
+    const first = app.inject({ method: "POST", url: `/api/files/${imageId}/ocr` });
+    while (!seenPaths.length) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal((await app.inject({ method: "POST", url: `/api/files/${imageId}/ocr` })).statusCode, 429);
+    assert.equal((await app.inject({ method: "POST", url: `/api/files/${textId}/ocr` })).statusCode, 415);
+    assert.equal((await app.inject({ method: "POST", url: "/api/files/not-an-id/ocr" })).statusCode, 415);
+    assert.equal((await app.inject({ method: "POST", url: `/api/files/${imageId}/ocr`, headers: { origin: "https://untrusted.example" } })).statusCode, 403);
+    releaseOcr();
+    const recognized = await first;
+    assert.equal(recognized.statusCode, 200);
+    assert.deepEqual(recognized.json(), { text: "测试 OCR text" });
+    assert.equal(recognized.headers["cache-control"], "private, no-store");
+    assert.equal(seenPaths.length, 1);
+    assert.ok(seenPaths[0].startsWith(path.join(dataDir, "files") + path.sep));
+  } finally { releaseOcr(); await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
 test("oversized and concurrent uploads cannot exceed quotas or leave partial files", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "relay-quota-security-"));
   const app = await buildApp({ dataDir, serveFrontend: false, maxUploadBytes: 10, maxStorageBytes: 10, ...disk });

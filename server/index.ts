@@ -12,6 +12,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { normalizeFilename, RelayStore, UUID_PATTERN, type FileRecord } from "./store.js";
 import { NotebookStore, type NoteReservation } from "./notes.js";
+import { recognizeImageText } from "./ocr.js";
 
 interface BuildOptions {
   dataDir?: string;
@@ -20,6 +21,7 @@ interface BuildOptions {
   serveFrontend?: boolean;
   minFreeDiskBytes?: number;
   freeDiskBytes?: () => Promise<number>;
+  ocrRunner?: (filePath: string) => Promise<string>;
 }
 
 const DEFAULT_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
@@ -30,6 +32,7 @@ const DEFAULT_MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024;
 const DISK_CHECK_BYTES = 1024 * 1024;
 const ARCHIVE_TICKET_TTL_MS = 60_000;
 const MAX_ARCHIVE_TICKETS = 128;
+const MAX_OCR_FILE_BYTES = 20 * 1024 * 1024;
 const THUMBNAIL_IMAGE_TYPES = new Set([
   "image/avif",
   "image/gif",
@@ -161,6 +164,8 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
       });
     }
   };
+  const ocrRunner = options.ocrRunner ?? recognizeImageText;
+  let ocrRunning = false;
 
   const app = Fastify({
     logger: process.env.NODE_ENV !== "test",
@@ -523,6 +528,28 @@ export async function buildApp(options: BuildOptions = {}): Promise<FastifyInsta
       .header("Cache-Control", "private, max-age=31536000, immutable")
       .header("Content-Security-Policy", "default-src 'none'; sandbox");
     return reply.send(createReadStream(store.thumbnailPath(file)));
+  });
+
+  app.post<{ Params: { id: string } }>("/api/files/:id/ocr", async (request, reply) => {
+    const file = store.getFile(request.params.id);
+    if (!file || !THUMBNAIL_IMAGE_TYPES.has(file.mime) || !(await store.verifyFile(file))
+      || !(await store.thumbnailSize(file))) {
+      return reply.code(415).send({ error: "这个文件不能安全识别。" });
+    }
+    if (file.size > MAX_OCR_FILE_BYTES) {
+      return reply.code(413).send({ error: "图片超过 20 MiB，请压缩后再识别。" });
+    }
+    if (ocrRunning) return reply.code(429).send({ error: "文字识别正在忙，请稍后重试。" });
+    ocrRunning = true;
+    try {
+      const text = await ocrRunner(store.filePath(file));
+      return reply.header("Cache-Control", "private, no-store").send({ text });
+    } catch (error) {
+      app.log.warn({ fileId: file.id, error }, "Image OCR failed");
+      return reply.code(503).send({ error: "图片文字识别失败，请稍后重试。" });
+    } finally {
+      ocrRunning = false;
+    }
   });
 
   app.patch<{ Params: { id: string }; Body: { name?: unknown } }>("/api/files/:id", async (request, reply) => {

@@ -16,7 +16,8 @@ ENV NODE_ENV=production \
     PORT=8787 \
     DATA_DIR=/data
 
-RUN corepack enable \
+RUN apk add --no-cache tesseract-ocr tesseract-ocr-data-chi_sim tesseract-ocr-data-eng \
+    && corepack enable \
     && addgroup -g 10001 -S relay \
     && adduser -S -D -H -u 10001 -G relay relay
 
