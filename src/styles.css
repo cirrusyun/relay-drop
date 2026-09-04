@@ -526,9 +526,11 @@ select:focus-visible,
 .note-title::placeholder, .note-content::placeholder { color: var(--ink-faint); }
 .note-attachments { display: grid; gap: 18px; margin: 0 0 18px; }
 .note-attachment { position: relative; min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; background: var(--surface-subtle); }
+.note-attachment-open { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.note-attachment-open:disabled { cursor: default; }
 .note-attachment-image { display: block; width: 100%; height: auto; max-height: none; object-fit: contain; background: var(--surface-hover); }
-.note-attachment-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 42px; padding: 7px 8px 7px 12px; border-top: 1px solid var(--line); color: var(--ink-soft); }
-.note-attachment-toolbar > span, .note-attachment.is-missing > span { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.note-attachment-toolbar { display: flex; align-items: center; justify-content: flex-end; min-height: 42px; padding: 7px 8px; border-top: 1px solid var(--line); color: var(--ink-soft); }
+.note-attachment.is-missing > span { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .note-attachment-toolbar > div { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
 .note-attachment-action { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-solid); color: var(--ink-soft); font-size: 10px; font-weight: 600; cursor: pointer; }
 .note-attachment-action:hover { border-color: var(--line-strong); background: var(--surface-hover); }
@@ -548,16 +550,30 @@ select:focus-visible,
 .notebook-error, .note-delete-confirm { margin-top: 14px; padding: 12px; border-radius: 12px; background: var(--amber-soft); color: var(--amber); font-size: 12px; }
 .note-delete-confirm { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .note-delete-confirm > div { display: flex; gap: 8px; }
-.image-lightbox { position: fixed; z-index: 40; inset: 0; display: grid; overflow: auto; place-items: center; padding: 62px 28px 28px; background: color-mix(in srgb, #050608 88%, transparent); backdrop-filter: blur(16px); }
+.image-lightbox { position: fixed; z-index: 40; inset: 0; display: grid; overflow: auto; place-items: center; padding: 66px 28px 28px; background: color-mix(in srgb, #050608 88%, transparent); backdrop-filter: blur(16px); }
 .image-lightbox.is-zoomed { place-items: start center; }
-.image-lightbox-content { position: relative; display: grid; max-width: 100%; max-height: 100%; min-width: 180px; min-height: 120px; justify-items: center; align-items: center; gap: 12px; color: #fff; }
-.image-lightbox-content img { display: block; max-width: min(calc(100vw - 56px), 1600px); max-height: calc(100vh - 110px); border-radius: 14px; opacity: 0; object-fit: contain; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); cursor: zoom-in; }
+.image-lightbox-shell { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); align-items: stretch; gap: 16px; width: min(100%, 1800px); max-height: calc(100vh - 94px); }
+.image-lightbox-content { position: relative; display: grid; min-width: 180px; min-height: 180px; place-items: center; color: #fff; }
+.image-lightbox-content img { display: block; max-width: min(calc(100vw - 448px), 1400px); max-height: calc(100vh - 94px); border-radius: 14px; opacity: 0; object-fit: contain; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); cursor: zoom-in; }
 .image-lightbox-content img.is-ready { opacity: 1; }
+.image-lightbox.is-zoomed .image-lightbox-shell { width: max-content; max-width: none; max-height: none; align-items: start; }
 .image-lightbox.is-zoomed .image-lightbox-content { max-width: none; max-height: none; }
 .image-lightbox.is-zoomed .image-lightbox-content img { max-width: none; max-height: none; cursor: zoom-out; }
-.image-lightbox-content span { max-width: min(80vw, 720px); overflow: hidden; color: rgb(255 255 255 / 72%); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .image-lightbox-state { position: absolute; z-index: 1; display: flex; align-items: center; gap: 9px; color: rgb(255 255 255 / 76%); font-size: 12px; }
 .image-lightbox-state button { padding: 7px 10px; border: 1px solid rgb(255 255 255 / 18%); border-radius: 9px; background: rgb(255 255 255 / 10%); color: #fff; cursor: pointer; }
+.image-ocr-panel { display: flex; min-height: 260px; max-height: calc(100vh - 94px); padding: 16px; flex-direction: column; gap: 12px; border: 1px solid rgb(255 255 255 / 14%); border-radius: 16px; background: rgb(20 21 24 / 88%); color: #fff; box-shadow: 0 24px 80px rgb(0 0 0 / 32%); backdrop-filter: blur(18px); }
+.image-ocr-heading, .image-ocr-heading strong, .image-ocr-heading > div { display: flex; align-items: center; }
+.image-ocr-heading { justify-content: space-between; gap: 12px; }
+.image-ocr-heading strong { gap: 7px; font-size: 12px; font-weight: 650; }
+.image-ocr-heading > div { gap: 6px; }
+.image-ocr-heading button { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid rgb(255 255 255 / 14%); border-radius: 10px; background: rgb(255 255 255 / 8%); color: rgb(255 255 255 / 82%); cursor: pointer; }
+.image-ocr-heading button:hover { background: rgb(255 255 255 / 14%); color: #fff; }
+.image-ocr-heading button:disabled { opacity: 0.35; cursor: default; }
+.image-ocr-state { display: flex; min-height: 150px; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: rgb(255 255 255 / 62%); font-size: 12px; text-align: center; }
+.image-ocr-state button { padding: 7px 11px; border: 1px solid rgb(255 255 255 / 14%); border-radius: 9px; background: rgb(255 255 255 / 8%); color: #fff; cursor: pointer; }
+.image-ocr-text { width: 100%; min-height: 190px; flex: 1; padding: 12px; resize: none; border: 1px solid rgb(255 255 255 / 12%); border-radius: 11px; outline: none; background: rgb(0 0 0 / 22%); color: rgb(255 255 255 / 92%); font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; cursor: text; user-select: text; }
+.image-ocr-text:focus { border-color: rgb(126 109 255 / 65%); box-shadow: 0 0 0 3px rgb(126 109 255 / 14%); }
+.image-ocr-panel > small { color: rgb(255 255 255 / 42%); font-size: 10px; }
 .image-lightbox-actions { position: fixed; z-index: 2; top: max(18px, env(safe-area-inset-top)); right: max(18px, env(safe-area-inset-right)); display: flex; gap: 8px; }
 .image-lightbox-actions button { display: grid; width: 40px; height: 40px; place-items: center; border: 1px solid rgb(255 255 255 / 16%); border-radius: 13px; background: rgb(255 255 255 / 10%); color: #fff; cursor: pointer; backdrop-filter: blur(12px); }
 .image-lightbox-actions button:hover { background: rgb(255 255 255 / 18%); }
@@ -568,6 +584,14 @@ select:focus-visible,
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } }
 
 @media (max-width: 680px) {
+  .image-lightbox { place-items: start stretch; padding: 66px 12px 16px; }
+  .image-lightbox-shell, .image-lightbox.is-zoomed .image-lightbox-shell { grid-template-columns: minmax(0, 1fr); width: 100%; max-width: 100%; max-height: none; }
+  .image-lightbox-content { min-height: 160px; }
+  .image-lightbox-content img { max-width: 100%; max-height: 56vh; }
+  .image-lightbox.is-zoomed .image-lightbox-content { overflow: auto; place-items: start; }
+  .image-lightbox.is-zoomed .image-lightbox-content img { max-width: none; }
+  .image-ocr-panel { min-height: 230px; max-height: 42vh; }
+  .image-ocr-text { min-height: 150px; }
   .notebook-layout { grid-template-columns: minmax(0, 1fr); }
   .notebook-list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 220px; overflow-y: auto; }
   .notebook-editor { padding: 20px 18px; }
@@ -630,7 +654,7 @@ select:focus-visible,
   @page { size: auto; margin: 14mm; }
   :root { color-scheme: light; }
   body { background: #fff !important; color: #111 !important; }
-  .ambient, .topbar, .notebook-heading, .notebook-list, .notebook-error, .note-delete-confirm, .note-editor-footer, .toast { display: none !important; }
+  .ambient, .topbar, .notebook-heading, .notebook-list, .notebook-error, .note-delete-confirm, .note-editor-footer, .image-lightbox, .toast { display: none !important; }
   .shell { width: 100%; max-width: none; margin: 0; padding: 0; }
   .notebook, .notebook-layout, .notebook-editor { display: block !important; min-height: 0; }
   .notebook-layout { border: 0; border-radius: 0; background: #fff; box-shadow: none; }

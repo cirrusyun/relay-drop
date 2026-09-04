@@ -1,6 +1,7 @@
 import { ArrowLeft, BookOpen, Check, Copy, FileDown, ImagePlus, LoaderCircle, Plus, RefreshCw, ScanText, Trash2, X } from "lucide-react";
 import { type ChangeEvent, type ClipboardEvent, type Ref, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { api, ApiError } from "./api";
+import { ImageLightbox } from "./ImageLightbox";
 import { canApplyNoteRead, emptyNoteDraft, sameNoteDraft, settleNoteWrite, type Note, type NoteDraft, type NoteSummary } from "./note-editor";
 
 export interface NotebookHandle { saveBeforeLeave(): Promise<boolean> }
@@ -61,6 +62,7 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
   const [uploadingImages, setUploadingImages] = useState(false);
   const [recognizingIds, setRecognizingIds] = useState<Set<string>>(() => new Set());
   const [printing, setPrinting] = useState(false);
+  const [previewImage, setPreviewImage] = useState<NotebookImage | null>(null);
   const [error, setError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const selectedRef = useRef<Note | null>(null);
@@ -74,6 +76,7 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
   const composing = useRef(false);
   const uploadingImagesRef = useRef(false);
   const recognizingIdsRef = useRef(new Set<string>());
+  const ocrTextCache = useRef(new Map<string, string>());
   const imageInput = useRef<HTMLInputElement>(null);
   const listRequest = useRef(0);
   const busy = working || saving || uploadingImages || printing;
@@ -94,6 +97,7 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
     setDraft(draftRef.current);
     setIsNew(fresh);
     setConfirmDelete(false);
+    setPreviewImage(null);
     setError("");
   }, []);
 
@@ -197,6 +201,7 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
     try {
       const result = await imageTextApi(file.id);
       const recognized = result.text.trim();
+      ocrTextCache.current.set(file.id, recognized);
       if (!recognized) {
         if (announce) notify("没有识别到清晰文字");
         return "empty";
@@ -348,9 +353,10 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
                 const file = files.find((candidate) => candidate.id === id);
                 const recognizing = recognizingIds.has(id);
                 return file ? <div className="note-attachment" key={id}>
-                  <img className="note-attachment-image" src={`/api/files/${file.id}/preview`} alt={file.name} loading="lazy" decoding="async" />
+                  <button className="note-attachment-open" type="button" onClick={() => setPreviewImage(file)} disabled={navigationBusy} aria-label={`查看并识别 ${file.name}`} title="打开原图并选择文字">
+                    <img className="note-attachment-image" src={`/api/files/${file.id}/preview`} alt={file.name} loading="lazy" decoding="async" />
+                  </button>
                   <div className="note-attachment-toolbar">
-                    <span title={file.name}>{file.name}</span>
                     <div>
                       <button className="note-attachment-action" onClick={() => void recognizeImage(file)} disabled={navigationBusy} aria-label={`识别 ${file.name} 中的文字`} title="识别图片文字并追加到笔记"><span>{recognizing ? "识别中" : "OCR"}</span>{recognizing ? <LoaderCircle className="spin" size={13} /> : <ScanText size={13} />}</button>
                       <button className="note-attachment-remove" onClick={() => changeDraft("attachments", draftRef.current.attachments.filter((attachment) => attachment !== id))} disabled={navigationBusy} aria-label={`从笔记移除 ${file.name}`} title="从笔记移除，文件仍保留在中转区"><X size={13} /></button>
@@ -372,6 +378,7 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
           </> : <div className="empty-state notebook-empty"><BookOpen size={32} /><strong>留住值得保存的文字</strong><span>选择一条笔记，或从剪贴板存入</span></div>}
         </div>
       </div>
+      {previewImage && <ImageLightbox key={previewImage.id} image={previewImage} initialOcrText={ocrTextCache.current.get(previewImage.id)} onRecognized={(text) => ocrTextCache.current.set(previewImage.id, text)} onClose={() => setPreviewImage(null)} />}
     </section>
   );
 }

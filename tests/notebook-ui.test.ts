@@ -314,7 +314,7 @@ test("saving the clipboard during the initial read starts a replacement read and
 
 test("file thumbnails open the same original-image preview while download remains separate", async (t) => {
   const image = { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", name: "shared.png", size: 10, mime: "image/png", createdAt: "2026-01-01T00:00:00Z", hasThumbnail: true };
-  await setup(t, ({ control }) => { control.files = [image]; }, false);
+  const { requests } = await setup(t, ({ control }) => { control.files = [image]; control.ocrText = "Selectable OCR text"; }, false);
   await flush();
   assert.equal(dom.document.querySelector<HTMLImageElement>('.file-thumbnail img')?.getAttribute("src"), `/api/files/${image.id}/thumbnail`);
   assert.equal(dom.document.querySelector<HTMLAnchorElement>(`a[aria-label="下载 ${image.name}"]`)?.getAttribute("href"), `/api/files/${image.id}/download`);
@@ -323,6 +323,13 @@ test("file thumbnails open the same original-image preview while download remain
   const preview = dom.document.querySelector<HTMLImageElement>('.image-lightbox img');
   assert.equal(preview?.getAttribute("src"), `/api/files/${image.id}/preview?attempt=0`);
   await act(async () => { preview?.dispatchEvent(new dom.Event("load")); });
+  await flush();
+  const ocrText = dom.document.querySelector<HTMLTextAreaElement>('[aria-label="可选择的图片识别文字"]');
+  assert.equal(ocrText?.value, "Selectable OCR text");
+  assert.equal(ocrText?.readOnly, true);
+  assert.equal(dom.document.querySelector<HTMLButtonElement>('[aria-label="复制图片识别文字"]')?.disabled, false);
+  assert.equal(requests.filter((request) => request.url === `/api/files/${image.id}/ocr`).length, 1);
+  assert.doesNotMatch(dom.document.querySelector(".image-lightbox")?.textContent ?? "", /shared\.png/);
   await click('[aria-label="查看原始尺寸"]');
   assert.ok(dom.document.querySelector('.image-lightbox')?.classList.contains("is-zoomed"));
   await click('[aria-label="关闭原图预览"]');
@@ -364,13 +371,17 @@ test("saved note images expand inline from the original and unlink without delet
   });
   await openNote("Test A");
   assert.equal(dom.document.querySelector<HTMLImageElement>('.note-attachment-image')?.getAttribute("src"), `/api/files/${image.id}/preview`);
-  assert.equal(dom.document.querySelector('.note-attachment-toolbar > span')?.textContent, image.name);
+  assert.doesNotMatch(dom.document.querySelector('.note-attachment-toolbar')?.textContent ?? "", /fixture\.png/);
   assert.equal(dom.document.querySelector('.note-attachment a'), null);
-  assert.equal(dom.document.querySelector('.note-attachment-preview'), null);
+  assert.ok(dom.document.querySelector(`[aria-label="查看并识别 ${image.name}"]`));
   assert.equal(dom.document.querySelector('.image-lightbox'), null);
   control.ocrText = "Manual OCR result";
   await click(`[aria-label="识别 ${image.name} 中的文字"]`);
   assert.equal(notes.get("a")?.content, "Original A\n\nManual OCR result");
+  await click(`[aria-label="查看并识别 ${image.name}"]`);
+  assert.equal(dom.document.querySelector<HTMLTextAreaElement>('[aria-label="可选择的图片识别文字"]')?.value, "Manual OCR result");
+  assert.doesNotMatch(dom.document.querySelector(".image-lightbox")?.textContent ?? "", /fixture\.png/);
+  await click('[aria-label="关闭原图预览"]');
   await click('.note-attachment-remove');
   await click('.note-editor-actions .primary');
   assert.deepEqual(notes.get("a")?.attachments, []);
