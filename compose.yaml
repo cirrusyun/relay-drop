@@ -25,7 +25,8 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 128
-    mem_limit: 256m
+    # Tesseract's Chinese model needs a short burst above 256 MiB while recognizing.
+    mem_limit: 384m
 
   caddy:
     image: caddy:2.11.4-alpine
