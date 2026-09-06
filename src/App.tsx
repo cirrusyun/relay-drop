@@ -956,7 +956,7 @@ export default function App() {
           <div className="brand-mark"><CloudUpload size={19} strokeWidth={2} /></div>
           <div>
             <strong>Relay</strong>
-            <span>私人文件传输助手</span>
+            <span>文件传输助手</span>
           </div>
         </div>
         <div className="topbar-actions">
