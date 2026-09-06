@@ -26,7 +26,6 @@ import {
 } from "lucide-react";
 import {
   type ChangeEvent,
-  type ClipboardEvent,
   type DragEvent,
   type ReactNode,
   useCallback,
@@ -159,6 +158,29 @@ function pastedImageName(file: globalThis.File, index: number): string {
     String(now.getSeconds()).padStart(2, "0"),
   ].join("");
   return `剪贴板图片-${stamp}${index ? `-${index + 1}` : ""}.${extension}`;
+}
+
+function filesFromClipboard(data: DataTransfer | null): globalThis.File[] {
+  if (!data) return [];
+  const directFiles = Array.from(data.files ?? []);
+  if (directFiles.length) return directFiles;
+  return Array.from(data.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is globalThis.File => file !== null);
+}
+
+function preparePastedFiles(files: globalThis.File[]): globalThis.File[] {
+  let imageIndex = 0;
+  return files.map((file) => {
+    if (!file.type.startsWith("image/")) return file;
+    const prepared = new globalThis.File([file], pastedImageName(file, imageIndex), {
+      type: file.type || "image/png",
+      lastModified: Date.now(),
+    });
+    imageIndex += 1;
+    return prepared;
+  });
 }
 
 // 重命名时默认只选中扩展名之前的部分，和 Finder / 资源管理器一致。
@@ -742,20 +764,18 @@ export default function App() {
     setUploads((current) => current.filter((task) => task.id !== taskId));
   };
 
-  const onClipboardPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
-    const images = Array.from(event.clipboardData.items)
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
-      .filter((file): file is globalThis.File => file !== null)
-      .map((file, index) => new globalThis.File([file], pastedImageName(file, index), {
-        type: file.type || "image/png",
-        lastModified: Date.now(),
-      }));
-
-    if (!images.length) return;
-    event.preventDefault();
-    void addFiles(images);
-  };
+  useEffect(() => {
+    const onPaste = (event: globalThis.ClipboardEvent) => {
+      // 笔记本有自己的图片粘贴逻辑；普通文件只进入中转首页。
+      if (notebookOpenRef.current) return;
+      const files = filesFromClipboard(event.clipboardData);
+      if (!files.length) return;
+      event.preventDefault();
+      void addFiles(preparePastedFiles(files));
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [addFiles]);
 
   const onFileInput = (event: ChangeEvent<HTMLInputElement>) => {
     if (event.target.files) void addFiles(event.target.files);
@@ -983,7 +1003,6 @@ export default function App() {
             dirtyRef.current = event.target.value !== state.clipboard.content;
             setDirty(dirtyRef.current);
           }}
-          onPaste={onClipboardPaste}
           onCompositionStart={() => { clipboardEditRevision.current += 1; composingRef.current = true; setComposing(true); }}
           onCompositionEnd={() => { composingRef.current = false; setComposing(false); }}
           onFocus={() => { clipboardFocused.current = true; }}
@@ -1060,7 +1079,7 @@ export default function App() {
           <div className="drop-icon"><CloudUpload size={24} /></div>
           <div className="drop-copy">
             <strong>{dragging ? "松开即可上传" : "拖拽文件到这里"}</strong>
-            <span>或点按选择多个文件 · 单个最大 {formatBytes(state.limits.maxUploadBytes)}</span>
+            <span>点按选择、直接粘贴 · 单个最大 {formatBytes(state.limits.maxUploadBytes)}</span>
           </div>
         </div>
 

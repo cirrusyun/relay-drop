@@ -121,6 +121,66 @@ test("clipboard save is kept in the footer while save-to-notebook stays in the h
   assert.ok(saveToNotebook?.closest(".card-heading"));
 });
 
+test("ordinary mode pastes multiple files into the transfer area without intercepting text", async (t) => {
+  const { control } = await setup(t, undefined, false);
+  const uploadedNames: string[] = [];
+  const originalXHR = globalThis.XMLHttpRequest;
+  class FakeXHR {
+    upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+    status = 201;
+    responseText = "";
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onabort: (() => void) | null = null;
+    open() {}
+    setRequestHeader() {}
+    abort() { this.onabort?.(); }
+    send(body: FormData) {
+      const file = body.get("file") as globalThis.File;
+      uploadedNames.push(file.name);
+      const relayFile = {
+        id: `file-${uploadedNames.length}`,
+        name: file.name,
+        size: file.size,
+        mime: file.type,
+        createdAt: "2026-01-01T00:00:00Z",
+        hasThumbnail: false,
+      };
+      this.responseText = JSON.stringify({ file: relayFile });
+      control.files.push(relayFile);
+      queueMicrotask(() => this.onload?.());
+    }
+  }
+  Object.defineProperty(globalThis, "XMLHttpRequest", { configurable: true, value: FakeXHR });
+  t.after(() => { Object.defineProperty(globalThis, "XMLHttpRequest", { configurable: true, value: originalXHR }); });
+
+  const textPaste = new dom.Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(textPaste, "clipboardData", { value: { files: [], items: [] } });
+  await act(async () => { dom.dispatchEvent(textPaste); });
+  assert.equal(textPaste.defaultPrevented, false);
+
+  const pdf = new dom.File(["pdf"], "课程讲义.pdf", { type: "application/pdf" });
+  const archive = new dom.File(["zip"], "项目.zip", { type: "application/zip" });
+  const filePaste = new dom.Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(filePaste, "clipboardData", { value: { files: [pdf, archive], items: [] } });
+  await act(async () => { dom.dispatchEvent(filePaste); });
+  await flush();
+  await flush();
+
+  assert.equal(filePaste.defaultPrevented, true);
+  assert.deepEqual(uploadedNames, ["课程讲义.pdf", "项目.zip"]);
+  assert.equal(control.files.length, 2);
+});
+
+test("ordinary file paste stays disabled while the notebook is open", async (t) => {
+  await setup(t);
+  const file = new dom.File(["pdf"], "note-source.pdf", { type: "application/pdf" });
+  const event = new dom.Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", { value: { files: [file], items: [] } });
+  await act(async () => { dom.dispatchEvent(event); });
+  assert.equal(event.defaultPrevented, false);
+});
+
 test("slow note switches preserve newly typed text and a later click saves it before switching", async (t) => {
   const { notes, control } = await setup(t);
   await openNote("Test A");
