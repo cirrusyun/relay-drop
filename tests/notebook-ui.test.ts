@@ -112,6 +112,153 @@ async function openNote(title: string) {
 const footer = () => dom.document.querySelector(".note-editor-footer")?.textContent;
 const editorVisible = () => !dom.document.querySelector(".notebook")?.hasAttribute("hidden");
 
+// Drive only autosave/backoff timers; request timeouts and other UI timers stay real.
+function autosaveClock(t: TestContext) {
+  const originalSet = dom.setTimeout;
+  const originalClear = dom.clearTimeout;
+  const pending = new Map<number, { run: () => void; delay: number }>();
+  let id = -1;
+  dom.setTimeout = ((run: () => void, delay: number, ...args: unknown[]) => {
+    if (delay === 2_000 || (delay > 9_000 && delay <= 10_000) || (delay > 19_000 && delay <= 20_000) || (delay > 29_000 && delay <= 30_000)) {
+      pending.set(id, { run, delay });
+      return id--;
+    }
+    return originalSet(run, delay, ...args);
+  }) as typeof dom.setTimeout;
+  dom.clearTimeout = ((timer: number) => { pending.delete(timer); originalClear(timer); }) as typeof dom.clearTimeout;
+  t.after(() => { dom.setTimeout = originalSet; dom.clearTimeout = originalClear; });
+  return {
+    pending,
+    async fire() {
+      assert.equal(pending.size, 1, "exactly one autosave timer should be active");
+      const [timer, job] = [...pending][0];
+      pending.delete(timer);
+      await act(async () => { job.run(); });
+      await flush();
+    },
+  };
+}
+
+test("autosave waits for a pause, stays silent, and survives reopening the notebook", async (t) => {
+  const { notes, requests } = await setup(t);
+  const clock = autosaveClock(t);
+  await openNote("Test A");
+  await type("笔记内容", "First keystrokes");
+  const firstTimer = [...clock.pending.keys()][0];
+  await type("笔记内容", "The finished sentence");
+  assert.equal(clock.pending.has(firstTimer), false);
+  assert.equal(notes.get("a")?.content, "Original A");
+  await clock.fire();
+  assert.equal(notes.get("a")?.content, "The finished sentence");
+  assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
+  assert.equal(dom.document.querySelector(".toast"), null);
+  assert.match(footer()!, /已保存/);
+  assert.equal(clock.pending.size, 0);
+  await click('[aria-label="返回中转首页"]');
+  await click('[aria-label="打开记事本"]');
+  await openNote("Test A");
+  assert.equal(field("笔记内容").value, "The finished sentence");
+});
+
+test("autosave waits for Chinese composition and preserves typing during a slow save", async (t) => {
+  const { notes, control } = await setup(t);
+  const clock = autosaveClock(t);
+  await openNote("Test A");
+  await act(async () => { field("笔记内容").dispatchEvent(new dom.CompositionEvent("compositionstart", { bubbles: true }) as unknown as Event); });
+  await type("笔记内容", "中文");
+  assert.equal(clock.pending.size, 0);
+  await act(async () => { field("笔记内容").dispatchEvent(new dom.CompositionEvent("compositionend", { bubbles: true }) as unknown as Event); });
+  const gate = deferred();
+  control.before = async (method) => { if (method === "PUT") await gate.promise; };
+  await clock.fire();
+  assert.equal(field("笔记内容").disabled, false);
+  assert.equal(dom.document.querySelector<HTMLButtonElement>('.note-item')?.disabled, false);
+  await type("笔记内容", "中文后面继续输入");
+  assert.equal(clock.pending.size, 0);
+  gate.resolve();
+  await flush();
+  assert.equal(notes.get("a")?.content, "中文");
+  assert.equal(field("笔记内容").value, "中文后面继续输入");
+  await clock.fire();
+  assert.equal(notes.get("a")?.content, "中文后面继续输入");
+});
+
+test("automatic retries recover a lost create response without duplicating a note", async (t) => {
+  const { notes, requests, control } = await setup(t);
+  const clock = autosaveClock(t);
+  await click('.notebook-heading .primary');
+  assert.equal(clock.pending.size, 0);
+  await type("笔记内容", "First version");
+  control.loseCreateResponse = true;
+  await clock.fire();
+  assert.equal(notes.size, 3);
+  assert.match(footer()!, /保存失败/);
+  assert.ok([...clock.pending.values()][0].delay > 9_000);
+  await type("笔记内容", "New version while offline");
+  await clock.fire();
+  const creates = requests.filter((request) => request.method === "POST");
+  assert.equal(notes.size, 3);
+  assert.deepEqual(creates[0].body, creates[1].body);
+  assert.equal(notes.get(creates[0].body.id)?.content, "New version while offline");
+  assert.match(footer()!, /已保存/);
+});
+
+test("switching notes cancels the old timer and attachment removal also autosaves", async (t) => {
+  const image = { id: "image-autosave", name: "sample.png", size: 10, mime: "image/png", createdAt: "2026-01-01T00:00:00Z", hasThumbnail: true };
+  const { notes, requests } = await setup(t, ({ notes, control }) => {
+    notes.set("a", { ...notes.get("a")!, attachments: [image.id] });
+    control.files = [image];
+  });
+  const clock = autosaveClock(t);
+  await openNote("Test A");
+  await click('[aria-label="从笔记移除 sample.png"]');
+  await clock.fire();
+  assert.deepEqual(notes.get("a")?.attachments, []);
+  await type("笔记内容", "Before switch");
+  await openNote("Test B");
+  assert.equal(clock.pending.size, 0);
+  assert.equal(notes.get("a")?.content, "Before switch");
+  assert.equal(notes.get("b")?.content, "Original B");
+  assert.equal(requests.filter((request) => request.method === "PUT" && request.url === "/api/notes/b").length, 0);
+});
+
+test("unsaved edits guard page reload, and a successful automatic save releases it", async (t) => {
+  const { control } = await setup(t);
+  const clock = autosaveClock(t);
+  await openNote("Test A");
+  await type("笔记内容", "Not yet saved");
+  const before = new dom.Event("beforeunload", { cancelable: true });
+  dom.dispatchEvent(before);
+  assert.equal(before.defaultPrevented, true);
+  control.failSave = true;
+  await clock.fire();
+  assert.equal(field("笔记内容").value, "Not yet saved");
+  control.failSave = false;
+  await act(async () => { dom.dispatchEvent(new dom.Event("online")); });
+  await flush();
+  const afterSave = new dom.Event("beforeunload", { cancelable: true });
+  dom.dispatchEvent(afterSave);
+  assert.equal(afterSave.defaultPrevented, false);
+  assert.equal(clock.pending.size, 0);
+});
+
+test("quota failures stop automatic retries and undoing back to saved text clears the error", async (t) => {
+  const { control, notes } = await setup(t);
+  const { ApiError } = await import("../src/api.js");
+  const clock = autosaveClock(t);
+  await openNote("Test A");
+  control.before = async (method) => { if (method === "PUT") throw new ApiError("空间已满", 507); };
+  await type("笔记内容", "Cannot fit");
+  await clock.fire();
+  assert.equal(clock.pending.size, 0);
+  assert.equal(notes.get("a")?.content, "Original A");
+  assert.match(footer()!, /保存失败/);
+  await type("笔记内容", "Original A");
+  assert.equal(clock.pending.size, 0);
+  assert.match(footer()!, /已保存/);
+  assert.equal(dom.document.querySelector(".notebook-error"), null);
+});
+
 test("clipboard save is kept in the footer while save-to-notebook stays in the heading", async (t) => {
   const { container } = await setup(t, undefined, false);
   await flush();

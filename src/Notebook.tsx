@@ -1,5 +1,5 @@
-import { ArrowLeft, BookOpen, Check, Copy, FileDown, ImagePlus, LoaderCircle, Plus, RefreshCw, ScanText, Trash2, X } from "lucide-react";
-import { type ChangeEvent, type ClipboardEvent, type Ref, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { ArrowLeft, BookOpen, Copy, FileDown, ImagePlus, LoaderCircle, PanelLeft, Plus, RefreshCw, ScanText, Trash2, X } from "lucide-react";
+import { type ChangeEvent, type ClipboardEvent, type Ref, useCallback, useEffect, useEffectEvent, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 import { ImageLightbox } from "./ImageLightbox";
 import { canApplyNoteRead, emptyNoteDraft, sameNoteDraft, settleNoteWrite, type Note, type NoteDraft, type NoteSummary } from "./note-editor";
@@ -19,6 +19,8 @@ interface Props {
 const emptyDraft: NoteDraft = { title: "", content: "", attachments: [] };
 const NOTE_IMAGE_TYPES = new Set(["image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"]);
 const MAX_NOTE_CHARACTERS = 1_000_000;
+const AUTOSAVE_DELAY = 2_000;
+interface SaveFailure { message: string; retryable: boolean; attempt: number; retryAt: number }
 
 async function noteApi<T>(url: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
@@ -65,6 +67,9 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
   const [previewImage, setPreviewImage] = useState<NotebookImage | null>(null);
   const [error, setError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [saveFailure, setSaveFailure] = useState<SaveFailure | null>(null);
+  const [isComposing, setIsComposing] = useState(false);
+  const [showList, setShowList] = useState(true);
   const selectedRef = useRef<Note | null>(null);
   const draftRef = useRef(emptyDraft);
   const actionPending = useRef(false);
@@ -78,8 +83,11 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
   const recognizingIdsRef = useRef(new Set<string>());
   const ocrTextCache = useRef(new Map<string, string>());
   const imageInput = useRef<HTMLInputElement>(null);
+  const titleInput = useRef<HTMLInputElement>(null);
+  const contentInput = useRef<HTMLTextAreaElement>(null);
+  const documentRef = useRef<HTMLDivElement>(null);
   const listRequest = useRef(0);
-  const busy = working || saving || uploadingImages || printing;
+  const busy = working || uploadingImages || printing;
   const recognizingImages = recognizingIds.size > 0;
   const navigationBusy = busy || recognizingImages;
   const hasChanges = () => selectedRef.current !== null && (isNewRef.current
@@ -97,9 +105,39 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
     setDraft(draftRef.current);
     setIsNew(fresh);
     setConfirmDelete(false);
+    setSaveFailure(null);
+    setShowList(note === null);
     setPreviewImage(null);
     setError("");
   }, []);
+
+  useLayoutEffect(() => {
+    const input = contentInput.current;
+    if (!open || !input) return;
+    const resize = () => {
+      const documentTop = documentRef.current?.scrollTop ?? 0;
+      const pageTop = window.scrollY;
+      input.style.height = "0px";
+      input.style.height = `${input.scrollHeight}px`;
+      // Measuring a shorter textarea can clamp its ancestor's scroll position.
+      // Restore it in the same layout pass so typing at the end stays in view.
+      if (documentRef.current) documentRef.current.scrollTop = documentTop;
+      if (window.scrollY !== pageTop) window.scrollTo(0, pageTop);
+    };
+    resize();
+    // A mobile list/editor switch or a viewport resize changes line wrapping.
+    let width = input.clientWidth;
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => {
+      if (input.clientWidth !== width) { width = input.clientWidth; resize(); }
+    });
+    observer?.observe(input);
+    return () => observer?.disconnect();
+  }, [open, draft.content, selected?.id, showList]);
+
+  useEffect(() => {
+    documentRef.current?.scrollTo?.(0, 0);
+    if (isNewRef.current) titleInput.current?.focus();
+  }, [selected?.id]);
 
   const loadNotes = useCallback(async (refreshEditor = true) => {
     const request = ++listRequest.current;
@@ -136,7 +174,10 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
     if (savePending.current) return savePending.current;
     if (composing.current || deleting.current) return Promise.resolve(false);
     const note = selectedRef.current;
-    if (!note || !hasChanges()) return Promise.resolve(true);
+    if (!note || !hasChanges()) {
+      if (note && !silent) notify(isNewRef.current ? "空白笔记尚未保存" : "笔记已保存");
+      return Promise.resolve(true);
+    }
     editRevision.current += 1;
     setSaving(true);
     const acceptSave = (saved: Note, submitted: NoteDraft) => {
@@ -165,17 +206,66 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
           acceptSave(result.note, submitted);
         }
         setError("");
-        void loadNotes(false);
+        // Update the sidebar in place: autosaving must not spin its refresh
+        // button, reorder rows under the pointer, or trigger an editor read.
+        const savedNote = selectedRef.current!;
+        const summary: NoteSummary = {
+          id: savedNote.id, title: savedNote.title, createdAt: savedNote.createdAt, updatedAt: savedNote.updatedAt,
+          preview: Array.from(savedNote.content.replace(/\s+/g, " ")).slice(0, 100).join(""), characters: savedNote.content.length, attachmentCount: savedNote.attachments.length,
+        };
+        setNotes((current) => current.some((item) => item.id === summary.id)
+          ? current.map((item) => item.id === summary.id ? summary : item)
+          : [summary, ...current]);
+        setSaveFailure(null);
         onStorageChange();
         const saved = !hasChanges() && !composing.current;
         if (!silent) notify(saved ? "笔记已保存" : "已保存，新增文字仍保留在编辑区");
         return saved;
-      } catch (cause) { setError((cause as Error).message); return false; }
+      } catch (cause) {
+        const retryable = !(cause instanceof ApiError) || [408, 429, 500, 502, 503, 504].includes(cause.status);
+        setSaveFailure((previous) => {
+          const attempt = (previous?.attempt ?? 0) + 1;
+          return { message: (cause as Error).message, retryable, attempt, retryAt: Date.now() + Math.min(30_000, 5_000 * 2 ** Math.min(attempt, 3)) };
+        });
+        return false;
+      }
       finally { savePending.current = null; setSaving(false); }
     })();
     savePending.current = operation;
     return operation;
   };
+
+  const autosave = useEffectEvent(() => {
+    if (open && !actionPending.current && !uploadingImagesRef.current && !recognizingIdsRef.current.size && !printing && !confirmDelete) void save(true);
+  });
+
+  useEffect(() => {
+    if (!open || !dirty || saving || busy || recognizingImages || isComposing || confirmDelete || (saveFailure && !saveFailure.retryable)) return;
+    const wait = saveFailure ? Math.max(AUTOSAVE_DELAY, saveFailure.retryAt - Date.now()) : AUTOSAVE_DELAY;
+    const timer = window.setTimeout(() => autosave(), wait);
+    return () => window.clearTimeout(timer);
+  }, [open, draft, dirty, saving, busy, recognizingImages, isComposing, confirmDelete, saveFailure]);
+
+  const resumeSave = useEffectEvent(() => { if (!saveFailure || saveFailure.retryable) autosave(); });
+  useEffect(() => {
+    if (!open) return;
+    const onOnline = () => resumeSave();
+    const onVisibility = () => { if (document.visibilityState === "hidden") resumeSave(); };
+    const onUnload = (event: BeforeUnloadEvent) => {
+      if (hasChanges() || savePending.current || uploadingImagesRef.current || recognizingIdsRef.current.size) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("beforeunload", onUnload);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("beforeunload", onUnload);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [open]);
 
   useImperativeHandle(ref, () => ({
     async saveBeforeLeave() {
@@ -192,7 +282,12 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
     editRevision.current += 1;
     draftRef.current = { ...draftRef.current, [field]: value };
     setDraft(draftRef.current);
+    const changed = hasChanges();
+    setSaveFailure((previous) => previous && (!previous.retryable || !changed) ? null : previous);
   };
+
+  const startComposition = () => { composing.current = true; setIsComposing(true); editRevision.current += 1; };
+  const endComposition = () => { composing.current = false; setIsComposing(false); };
 
   const recognizeImage = async (file: NotebookImage, announce = true): Promise<"saved" | "draft" | "empty" | "failed"> => {
     if (recognizingIdsRef.current.has(file.id)) return "failed";
@@ -329,25 +424,43 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
     finally { deleting.current = false; actionPending.current = false; setWorking(false); }
   };
 
+  const saveStatus = saveFailure ? "error" : saving ? "saving" : dirty ? "pending" : "saved";
+  const saveDescription = saveFailure ? "保存失败，文字仍在编辑区" : saving ? "正在保存…" : uploadingImages ? "正在添加图片…" : recognizingImages ? "正在识别文字…" : dirty ? "未保存 · 等待自动保存" : isNew ? "新笔记" : "已保存";
+
   return (
-    <section className="notebook" hidden={!open} aria-label="记事本">
+    <section className={`notebook ${showList ? "is-list-view" : "is-editor-view"}`} hidden={!open} aria-label="记事本">
       <div className="notebook-heading">
         <button className="button ghost" onClick={onBack} disabled={navigationBusy}><ArrowLeft size={16} /> 返回中转</button>
         <button className="button primary" onClick={() => void newNote()} disabled={navigationBusy}><Plus size={16} /> 新建笔记</button>
       </div>
-      {error && <div className="notebook-error" role="alert">{error} <button className="button ghost" onClick={() => void loadNotes()}>刷新列表</button></div>}
+      {(saveFailure || error) && <div className="notebook-error" role="alert"><span>{saveFailure?.message || error}</span><button className="button ghost" onClick={() => { if (saveFailure) void save(true); else void loadNotes(); }} disabled={saving}>{saveFailure ? "重试保存" : "刷新列表"}</button></div>}
       <div className="card notebook-layout">
         <aside className="notebook-list" aria-label="笔记列表">
           <div className="notebook-list-heading"><h2>记事本 <span>{notes.length}</span></h2><button className="icon-button" aria-label="刷新笔记列表" onClick={() => void loadNotes()} disabled={loading}><RefreshCw size={15} className={loading ? "spin" : undefined} /></button></div>
-          {notes.map((note) => <button key={note.id} className={`note-item ${selected?.id === note.id ? "is-selected" : ""}`} onClick={() => void openNote(note.id)} disabled={navigationBusy} aria-pressed={selected?.id === note.id}>
+          <div className="notebook-list-scroll">
+          {isNew && selected && <button className="note-item is-selected" onClick={() => setShowList(false)} aria-pressed="true"><strong>{draft.title || "新笔记"}</strong><span>{draft.content || "写下第一句话…"}</span><small>草稿</small></button>}
+          {notes.map((note) => <button key={note.id} className={`note-item ${selected?.id === note.id ? "is-selected" : ""}`} onClick={() => { if (selectedRef.current?.id === note.id) setShowList(false); else void openNote(note.id); }} disabled={navigationBusy} aria-pressed={selected?.id === note.id}>
             <strong>{note.title}</strong><span>{note.preview || (note.attachmentCount ? `${note.attachmentCount} 张图片` : "空白笔记")}</span><small>{new Date(note.updatedAt).toLocaleDateString("zh-CN")} · {note.characters.toLocaleString()} 字符{note.attachmentCount ? ` · ${note.attachmentCount} 图` : ""}</small>
           </button>)}
-          {!notes.length && <p className="notebook-list-empty">{loading ? "正在读取…" : "还没有笔记"}</p>}
+          {!notes.length && !isNew && <p className="notebook-list-empty">{loading ? "正在读取…" : "还没有笔记"}</p>}
+          </div>
         </aside>
         <div className="notebook-editor">
           {selected ? <>
-            <input className="note-title" aria-label="笔记标题" placeholder="笔记标题" maxLength={120} value={draft.title} onCompositionStart={() => { composing.current = true; editRevision.current += 1; }} onCompositionEnd={() => { composing.current = false; }} onChange={(event) => changeDraft("title", event.target.value)} />
-            <textarea className="note-content" aria-label="笔记内容" placeholder="写点什么，或直接粘贴图片…" value={draft.content} spellCheck={false} onPaste={onNotePaste} onCompositionStart={() => { composing.current = true; editRevision.current += 1; }} onCompositionEnd={() => { composing.current = false; }} onChange={(event) => changeDraft("content", event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); void save(); } }} />
+            <div className="note-editor-toolbar">
+              <button className="button ghost note-show-list" onClick={() => setShowList(true)} aria-label="返回笔记列表"><PanelLeft size={16} /><span>笔记列表</span></button>
+              <div className="note-tools">
+                <input ref={imageInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/avif" multiple hidden onChange={onImageInput} />
+                <button className="icon-button" aria-label="导入图片" title="添加图片" onClick={() => imageInput.current?.click()} disabled={navigationBusy}>{uploadingImages ? <LoaderCircle className="spin" size={16} /> : <ImagePlus size={16} />}</button>
+                <button className="icon-button" aria-label="复制笔记内容" title="复制文字" onClick={() => { void navigator.clipboard.writeText(draft.content).then(() => notify("已复制笔记"), () => notify("请手动选择文字复制", "error")); }} disabled={!draft.content}><Copy size={16} /></button>
+                <button className="icon-button" onClick={() => void exportPdf()} disabled={navigationBusy || emptyNoteDraft(draft)} aria-label="导出当前笔记为 PDF" title="导出 PDF">{printing ? <LoaderCircle className="spin" size={16} /> : <FileDown size={16} />}</button>
+                <span className="note-tools-divider" />
+                <button className="icon-button note-delete-button" aria-label="删除笔记" title="删除笔记" onClick={() => setConfirmDelete(true)} disabled={navigationBusy}><Trash2 size={16} /></button>
+              </div>
+            </div>
+            <div className="note-document" ref={documentRef}>
+            <input ref={titleInput} className="note-title" aria-label="笔记标题" placeholder="无标题笔记" maxLength={120} value={draft.title} onCompositionStart={startComposition} onCompositionEnd={endComposition} onChange={(event) => changeDraft("title", event.target.value)} />
+            <textarea ref={contentInput} className="note-content" aria-label="笔记内容" placeholder="写点什么，或粘贴图片…" value={draft.content} spellCheck={false} onPaste={onNotePaste} onCompositionStart={startComposition} onCompositionEnd={endComposition} onChange={(event) => changeDraft("content", event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); void save(); } }} />
             {draft.attachments.length > 0 && <div className="note-attachments" aria-label="笔记图片">
               {draft.attachments.map((id) => {
                 const file = files.find((candidate) => candidate.id === id);
@@ -366,16 +479,13 @@ export function Notebook({ ref, open, revision, files, onBack, onStorageChange, 
               })}
             </div>}
             <div className="note-print-content" aria-hidden="true">{draft.content}</div>
-            {confirmDelete && <div className="note-delete-confirm" role="alert"><span>删除这条笔记？剪贴板内容不受影响。</span><div><button className="button ghost" onClick={() => setConfirmDelete(false)}>取消</button><button className="button danger-ghost" onClick={() => void removeNote()} disabled={navigationBusy}>确认删除</button></div></div>}
-            <div className="note-editor-footer"><span>{uploadingImages ? "图片上传并保存中…" : recognizingImages ? "正在识别图片文字…" : busy ? "处理中…" : dirty ? "未保存" : isNew ? "新笔记" : "已保存"}</span><div className="note-editor-actions">
-              <input ref={imageInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/avif" multiple hidden onChange={onImageInput} />
-              <button className="button secondary note-image-button" aria-label="导入图片" title="选择图片，也可以直接粘贴截图" onClick={() => imageInput.current?.click()} disabled={navigationBusy}>{uploadingImages ? <LoaderCircle size={15} className="spin" /> : <ImagePlus size={15} />}<span>图片</span></button>
-              <button className="icon-button" aria-label="删除笔记" onClick={() => setConfirmDelete(true)} disabled={navigationBusy}><Trash2 size={15} /></button>
-              <button className="button secondary" onClick={() => { void navigator.clipboard.writeText(draft.content).then(() => notify("已复制笔记"), () => notify("请手动选择文字复制", "error")); }} disabled={!draft.content}><Copy size={15} /> 复制</button>
-              <button className="button secondary" onClick={() => void exportPdf()} disabled={navigationBusy || (!draft.title.trim() && !draft.content.trim() && !draft.attachments.length)} aria-label="导出当前笔记为 PDF">{printing ? <LoaderCircle size={15} className="spin" /> : <FileDown size={15} />} PDF</button>
-              <button className="button primary" onClick={() => void save()} disabled={busy || !dirty}>{busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />} 保存</button>
-            </div></div>
-          </> : <div className="empty-state notebook-empty"><BookOpen size={32} /><strong>留住值得保存的文字</strong><span>选择一条笔记，或从剪贴板存入</span></div>}
+            </div>
+            {confirmDelete && <div className="note-delete-confirm" role="alert"><span>删除这条笔记？</span><div><button className="button ghost" onClick={() => setConfirmDelete(false)}>取消</button><button className="button danger-ghost" onClick={() => void removeNote()} disabled={navigationBusy || saving}>确认删除</button></div></div>}
+            <div className="note-editor-footer">
+              <span className="note-save-status" role="status" title={saveDescription}><i className={`note-save-dot is-${saveStatus}`} />{saveDescription}</span>
+              <div className="note-editor-actions"><span className="note-word-count">{draft.content.length.toLocaleString()} 字符</span><button className="button primary note-save-button" onClick={() => void save()} disabled={busy} aria-label="保存笔记" title="保存笔记（⌘ / Ctrl + Enter）">保存</button></div>
+            </div>
+          </> : <div className="empty-state notebook-empty"><div className="notebook-empty-icon"><BookOpen size={26} /></div><strong>从一条笔记开始</strong><span>选择左侧笔记，或新建一条</span><button className="button secondary" onClick={() => void newNote()}><Plus size={15} /> 新建笔记</button></div>}
         </div>
       </div>
       {previewImage && <ImageLightbox key={previewImage.id} image={previewImage} initialOcrText={ocrTextCache.current.get(previewImage.id)} onRecognized={(text) => ocrTextCache.current.set(previewImage.id, text)} onClose={() => setPreviewImage(null)} />}
